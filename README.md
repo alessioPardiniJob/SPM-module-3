@@ -1,12 +1,10 @@
 # High-Performance Hash Join Optimization
 
 ## Introduction
-This repository contains a comprehensive study and implementation of a high-performance Parallel Hash Join algorithm. The project focuses on mitigating common architectural bottlenecks in data processing, such as cache misses, pointer chasing, and thread contention. 
-
+This repository contains a comprehensive study and implementation of a high-performance Parallel Hash Join algorithm. 
 Through a series of incremental experiments, we explore:
 1. **Data Structure Efficiency**: Moving from node-based maps to hardware-conscious open-addressing maps.
 2. **Parallel Scheduling**: Evaluating Static (Block-based/Cyclic) vs. Dynamic (Thread Pool) strategies.
-3. **Partitioning Optimization**: Reducing memory bus contention through thread-local privatization and memory alignment.
 4. **Scalability**: Analyzing performance behavior under Strong and Weak scaling scenarios on multi-core architectures.
 
 ---
@@ -15,10 +13,6 @@ Through a series of incremental experiments, we explore:
 ```text
 .
 ├── bin/                                # Compiled executables
-├── log_chunk_tuning_*.txt              # Logs from chunk size optimization experiments
-├── log_detailed_*.txt                  # Verbose execution logs for scalability runs
-├── Makefile                            # Build system rules
-├── scalability_results.csv             # Data for strong scalability analysis
 ├── src/                                # Source code directory
 │   ├── hashjoin_par_final.cpp          # Final optimized parallel version
 │   ├── hashjoin_seq_flat_map.cpp       # Sequential version using ska::flat_hash_map
@@ -34,22 +28,19 @@ Through a series of incremental experiments, we explore:
 │           └── scatter/                # Atomic vs. Buffered vs. Local scatter
 ├── strong_scalability.sh               # Script for strong scalability testing
 ├── third_party/                        # External libraries (ska::flat_hash_map)
-├── tune_chunk_*.sh                     # Scripts for tuning parallel parameters
 ├── utils/                              # Core helpers (ThreadPool, Affinitization, Timers)
-├── weak_scalability_results.csv        # Data for weak scalability analysis
+│   ├── affinity.hpp                    # Thread affinity helpers
+│   ├── hpc_helpers.hpp                 # High-performance helpers
+│   ├── taskFactory.hpp                 # Task factory helpers
+│   ├── threadPool.hpp                  # Thread pool helpers
+│   └── utils.hpp                       # General helpers
+├── tune_chunk_*.sh                     # Scripts for tuning parallel parameters
+├── Makefile                            # Build system rules
 └── weak_scalability.sh                 # Script for weak scalability testing
+└── strong_scalability.sh               # Script for strong scalability testing
+
 ```
 
-
-## HOW TO EXECUTE
-Bash
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_unordered_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-```
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_flat_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-Output to check: Look at the ========== BENCHMARK PROFILE ========== section at the end of each run. Specifically, compare the times for build, probe, and the overall join_loop to evaluate the speedup gained from the optimized data structure. You should expect to see roughly a 3.4x speedup on the Build phase and a 2.7x speedup on the Probe phase.
 
 # EXPERIMENT 1 — Local Join Parallelization Strategy
 This section explores how to efficiently distribute the workload of the local join phase across threads. Since the relations are partitioned, join operations for each partition are entirely independent, allowing for lock-free parallelization.
