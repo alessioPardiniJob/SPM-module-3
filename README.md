@@ -40,8 +40,21 @@ Through a series of incremental experiments, we explore:
 └── strong_scalability.sh               # Script for strong scalability testing
 
 ```
-
-
+# EXPERIMENT 0 — Data Structure Efficiency ((std::unordered_map vs ska::flat_hash_map))
+This experiment evaluates the performance impact of replacing the standard node-based std::unordered_map with an open-addressing alternative (ska::flat_hash_map) during the local join phase. This shift resolves architectural bottlenecks by eliminating continuous dynamic memory allocations for newly inserted keys and avoiding unpredictable pointer chasing.
+## HOW TO COMPILE
+```bash 
+make unordered
+make flat
+```
+## HOW TO EXECUTE
+```bash 
+srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_unordered_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
+```
+```bash 
+srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_flat_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
+```
+Output to check: Look at the ========== BENCHMARK PROFILE ========== section at the end of the run.
 # EXPERIMENT 1 — Local Join Parallelization Strategy
 This section explores how to efficiently distribute the workload of the local join phase across threads. Since the relations are partitioned, join operations for each partition are entirely independent, allowing for lock-free parallelization.
 ## HOW TO COMPILE
