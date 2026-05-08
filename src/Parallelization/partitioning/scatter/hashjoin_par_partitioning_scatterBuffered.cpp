@@ -644,7 +644,7 @@ static JoinResult partitioned_hash_join_sequential(
     }
 
     return total;
-
+}
 // ------------------------------------------------------------
 // Verifier for very small inputs
 // ------------------------------------------------------------

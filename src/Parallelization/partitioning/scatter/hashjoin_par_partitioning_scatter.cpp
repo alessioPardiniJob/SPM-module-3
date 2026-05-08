@@ -201,7 +201,7 @@ static std::vector<std::vector<std::size_t>> compute_histogram_matrix(
     threads.reserve(num_threads);
 
     // block-based partitioning: each thread processes a contiguous block of records
-    auto block_based = [&](int threadid) {
+    auto block_based = [&](std::uint32_t threadid) {
         // Each thread computes its own local histogram for its assigned block of records.
         std::size_t total_records = rel.size();
         std::size_t parts_per_thread = total_records / num_threads;
@@ -209,7 +209,7 @@ static std::vector<std::vector<std::size_t>> compute_histogram_matrix(
         
         // Compute the range of records this thread will process
         std::size_t lower = threadid * parts_per_thread + std::min(static_cast<std::size_t>(threadid), rem);
-        std::size_t upper = lower + parts_per_thread + (threadid < static_cast<int>(rem) ? 1 : 0);
+        std::size_t upper = lower + parts_per_thread + (threadid < rem ? 1 : 0);
 
         // Compute local histogram for the assigned block of records
         auto& my_hist = local_hists[threadid];
@@ -323,7 +323,7 @@ static std::vector<Record> scatter_scalar_optimized(
         
         // Each thread processes a contiguous block of records, with the first 'rem' threads processing one extra record to handle any remainder.
         std::size_t lower = threadid * parts_per_thread + std::min(static_cast<std::size_t>(threadid), rem);
-        std::size_t upper = lower + parts_per_thread + (threadid < static_cast<int>(rem) ? 1 : 0);
+        std::size_t upper = lower + parts_per_thread + (threadid < rem ? 1 : 0);
 
         // Scatter the assigned block of records into the output array using the thread-specific write cursors.
         for (std::size_t i = lower; i < upper; ++i) {

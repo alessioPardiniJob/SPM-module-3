@@ -68,17 +68,17 @@ make parallel_localjoin_static_blockcyclic_optimized
 Determines the optimal configuration for chunk sizes across the Block-Cyclic and Dynamic strategies.
 ### HOW TO EXECUTE
 ```bash 
-./tune_chucnk_dynamic_threadPool.sh
+./tune_chunk_dynamic_threadPool.sh
 ```
 ```bash 
-./tune_chucnk_static_blockCyclic.sh
+./tune_chunk_static_blockCyclic.sh
 ```
 Output to check: Look at the median execution times across the different chunk sizes (e.g., C=1 through C=64) to identify the optimal parameter for workload distribution. [log_chunk_tuning_... .txt files]
 ## EXPERIMENT 1.2 - Workload Characterization & Scheduling
 Compares three scheduling strategies to handle workload balance: Static Block-Based, Static Block-Cyclic, and Dynamic Thread-Pool.
 ### HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_dynamic_threadPool -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 1
+srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_dynamic_threadPool -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 2
 ```
 ```bash 
 srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockBased -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
@@ -86,7 +86,7 @@ srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockBased -n
 ```bash 
 srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockCyclic -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 16
 ```
-Output to check: Compare the final join_loop times. In a uniform data setup, Block-Cyclic typically performs best (e.g., ~211 ms) due to the naturally balanced distribution. 
+Output to check: Compare the final join_loop times. In a uniform data setup, Block-Cyclic typically performs best due to the naturally balanced distribution. 
 
 ## EXPERIMENT 1.3 - Memory Allocation Hoisting Optimization
 Addresses the overhead of repeatedly constructing and destroying hash maps across all partitions by allocating a single map locally per thread outside the main loop.
@@ -124,13 +124,7 @@ srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatter_Atomic -n
 ``` 
 ```bash 
 srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatter -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatter_Atomic -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatterBuffered -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
+```
 Output to check: The _scatter_Atomic execution should be extremely slow due to thread stalling on memory synchronization. The optimized _scatter version should execute nearly 5x faster.
 
 # EXPERIMENT 3: Scalability
@@ -143,7 +137,7 @@ make parallel_final
 Analyzes performance when the total problem size is kept constant while the number of threads increases.
 ### HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:02:00 ./strong_scalability.sh 
+./strong_scalability.sh 
 ``` 
 Output to check: log_detailed_strong_scalability.txt
 
@@ -151,7 +145,7 @@ Output to check: log_detailed_strong_scalability.txt
 Evaluates the system by increasing the problem size proportionately with the number of threads. The objective is to maintain a strictly constant computational workload per thread across the algorithm's three primary kernels. Total records, total partitions, and the key range are all scaled up.
 ### HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:02:00 ./strong_scalability.sh 
+./weak_scalability.sh 
 ``` 
 Output to check: log_detailed_weak_scalability.txt
 
