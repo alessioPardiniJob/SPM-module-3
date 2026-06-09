@@ -1,154 +1,159 @@
 # High-Performance Hash Join Optimization
 
 ## Introduction
-This repository contains a comprehensive study and implementation of a high-performance Parallel Hash Join algorithm. 
-Through a series of incremental experiments, we explore:
-1. **Data Structure Efficiency**: Moving from node-based maps to hardware-conscious open-addressing maps.
-2. **Parallel Scheduling**: Evaluating Static (Block-based/Cyclic) vs. Dynamic (Thread Pool) strategies.
-4. **Scalability**: Analyzing performance behavior under Strong and Weak scaling scenarios on multi-core architectures.
-
+This module evaluates the performance of a partitioned hash join implementation by comparing sequential execution with C++ threading and OpenMP-based parallel strategies (loop-level and task-level). The objective is to analyze scalability and robustness under uniform and skewed workloads
 ---
 
 ## Repository Structure
 ```text
 .
-├── bin/                                # Compiled executables
-├── src/                                # Source code directory
-│   ├── hashjoin_par_final.cpp          # Final optimized parallel version
-│   ├── hashjoin_seq_flat_map.cpp       # Sequential version using ska::flat_hash_map
-│   ├── hashjoin_seq_unordered_map.cpp  # Sequential version using std::unordered_map
-│   └── Parallelization/
-│       ├── localJoin/                  # Experiment 1: Local Join strategies
-│       │   ├── ..._dynamic_threadPool.cpp
-│       │   ├── ..._static_blockBased.cpp
-│       │   ├── ..._static_blockCyclic.cpp
-│       │   └── ..._static_blockCyclic_Optimized.cpp
-│       └── partitioning/               # Experiment 2: Partitioning strategies
-│           ├── compute_histogram/      # Atomic vs. Local histogram computation
-│           └── scatter/                # Atomic vs. Buffered vs. Local scatter
-├── strong_scalability.sh               # Script for strong scalability testing
-├── third_party/                        # External libraries (ska::flat_hash_map)
-├── utils/                              # Core helpers (ThreadPool, Affinitization, Timers)
-│   ├── affinity.hpp                    # Thread affinity helpers
-│   ├── hpc_helpers.hpp                 # High-performance helpers
-│   ├── taskFactory.hpp                 # Task factory helpers
-│   ├── threadPool.hpp                  # Thread pool helpers
-│   └── utils.hpp                       # General helpers
-├── tune_chunk_*.sh                     # Scripts for tuning parallel parameters
-├── Makefile                            # Build system rules
-└── weak_scalability.sh                 # Script for weak scalability testing
-└── strong_scalability.sh               # Script for strong scalability testing
-
+├── Appendix.pdf
+├── benchmarking_scheduling.sh
+├── bin
+│   ├── hashjoin_par_ompLoopLevel_AdaptiveMemory
+│   └── hashjoin_par_ompTaskLevel_OvSubLocalJoin
+├── Makefile
+├── README.md
+├── Skewed_data_generation.pdf
+├── src
+│   ├── hashjoin_par_cpp.cpp
+│   ├── hashjoin_seq.cpp
+│   ├── hashjoin_skewnessAnalysis.cpp
+│   ├── omp_loop_level
+│   │   ├── memoryManagment
+│   │   │   ├── hashjoin_par_ompLoopLevel_1HM_x_partitions.cpp
+│   │   │   ├── hashjoin_par_ompLoopLevel_AdaptiveMemory.cpp
+│   │   │   └── hashjoin_par_ompLoopLevel.cpp
+│   │   └── tuningScheduling
+│   │       └── hashjoin_par_ompLoopLevel_AdaptiveMemoryTuning.cpp
+│   └── omp_task_level
+│       └── hashjoin_par_ompTaskLevel_OvSubLocalJoin.cpp
+├── strong_scalabilityLoopLevel.sh
+├── strong_scalabilityTaskLevel.sh
+├── third_party
+│   └── ska
+│       ├── bytell_hash_map.hpp
+│       ├── flat_hash_map.hpp
+│       └── unordered_map.hpp
+├── tune_bufferSize.sh
+├── tuning_chunkSize.sh
+├── utils
+│   ├── affinity.hpp
+│   ├── hpc_helpers.hpp
+│   ├── taskFactory.hpp
+│   ├── threadPool.hpp
+│   └── utils.hpp
+├── weak_scalabilityLoopLevel.sh
+└── weak_scalabilityTaskLevel.sh
 ```
-# EXPERIMENT 0 — Data Structure Efficiency ((std::unordered_map vs ska::flat_hash_map))
-This experiment evaluates the performance impact of replacing the standard node-based std::unordered_map with an open-addressing alternative (ska::flat_hash_map) during the local join phase. This shift resolves architectural bottlenecks by eliminating continuous dynamic memory allocations for newly inserted keys and avoiding unpredictable pointer chasing.
+# EXPERIMENT 0 — Skewness Analysis
+This initial experiment is intended to empirically verify that the data generation process is functioning correctly.
 ## HOW TO COMPILE
 ```bash 
-make unordered
-make flat
+make skewness_analysis
 ```
 ## HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_unordered_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
+srun -w node07 --exclusive --time=00:01:00 ./bin/skewness_analysis -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2
 ```
 ```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_seq_flat_map -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
+srun -w node07 --exclusive --time=00:01:00 ./bin/skewness_analysis -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2
 ```
-Output to check: Look at the ========== BENCHMARK PROFILE ========== section at the end of the run.
-# EXPERIMENT 1 — Local Join Parallelization Strategy
-This section explores how to efficiently distribute the workload of the local join phase across threads. Since the relations are partitioned, join operations for each partition are entirely independent, allowing for lock-free parallelization.
+Output to check: uniform_data.csv and skew_data.csv and terminal output 
+# EXPERIMENT 1 — Loop Level Parallelism
+This section contains all experiments related to loop-level parallelism.
 ## HOW TO COMPILE
 ```bash 
-make parallel_localjoin_static_blockbased
-make parallel_localjoin_static_blockcyclic
-make parallel_localjoin_dynamic_threadpool
-make parallel_localjoin_static_blockcyclic_optimized
+make parallel_omp_loop_level
+make parallel_omp_loop_level_join_adaptive_memory
+make parallel_omp_loop_level_join_1hm_x_partitions
+make parallel_omp_loop_level_join_adaptive_memory_tuning_scheduling
 ```
-## EXPERIMENT 1.1 - Tuning of Chunk Size
-Determines the optimal configuration for chunk sizes across the Block-Cyclic and Dynamic strategies.
+## EXPERIMENT 1.1 - Memory Managment
+This experiment evaluates different memory management strategies in the local join kernel under both uniform and skewed workload distributions. The goal is to assess how allocation policy and hash table reuse impact performance, particularly during the build and probe phases of the join operation.
 ### HOW TO EXECUTE
 ```bash 
-./tune_chunk_dynamic_threadPool.sh
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
 ```bash 
-./tune_chunk_static_blockCyclic.sh
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
-Output to check: Look at the median execution times across the different chunk sizes (e.g., C=1 through C=64) to identify the optimal parameter for workload distribution. [log_chunk_tuning_... .txt files]
-## EXPERIMENT 1.2 - Workload Characterization & Scheduling
-Compares three scheduling strategies to handle workload balance: Static Block-Based, Static Block-Cyclic, and Dynamic Thread-Pool.
-### HOW TO EXECUTE
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_dynamic_threadPool -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 2
-```
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockBased -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-```
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockCyclic -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 16
-```
-Output to check: Compare the final join_loop times. In a uniform data setup, Block-Cyclic typically performs best due to the naturally balanced distribution. 
 
-## EXPERIMENT 1.3 - Memory Allocation Hoisting Optimization
-Addresses the overhead of repeatedly constructing and destroying hash maps across all partitions by allocating a single map locally per thread outside the main loop.
+```bash 
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_1HM_x_partitions -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
+```
+```bash 
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_1HM_x_partitions -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
+```
+
+```bash 
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_AdaptiveMemory -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
+```
+```bash 
+srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_AdaptiveMemory -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
+```
+Output to check: Look at the ========== BENCHMARK PROFILE ========== section for each run, in particular --- JOIN PHASE ---.
+## EXPERIMENT 1.2 - Workload Scheduling Analysis
+Compares different scheduling strategies and chunksize to handle workload balance.
 ### HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_localjoin_static_blockCyclic_Optimized -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256 -chunk 16
+./benchmarking_scheduling.sh
 ```
-Output to check: Look for the reduction in the join_loop execution time compared to Experiment 1.2.
+Output to check: Compare the final join_loop times.
 
-## EXPERIMENT 2 — Partitioning Parallelization Strategy
-This phase tackles the memory-bandwidth-bound operations of partitioning: calculating the histograms and scattering the data.
+# EXPERIMENT 2 — Task Level Parallelism
+This section contains all experiments related to task-level parallelism.
 ## HOW TO COMPILE
 ```bash 
-make parallel_partitioning_compute_histogram_globalatomic
-make parallel_partitioning_compute_histogram_local
-make parallel_partitioning_scatter_globalatomic
-make parallel_partitioning_scatter
-make parallel_partitioning_scatter_buffered
+make parallel_omp_task_level_oversubscription_localjoin
 ```
-## EXPERIMENT 2.1 - Compute histogram
-Compares a naive approach using shared atomic updates against a thread-local privatization strategy. 
-### HOW TO EXECUTE
+## HOW TO EXECUTE
 ```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_compute_histogram_globalAtomic -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_compute_histogram_local -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-Output to check: Notice the severe bottleneck in the global atomic run due to memory bus contention. The local privatization version should be faster.
-## EXPERIMENT 2.2 - Scatter Phase
-Evaluates the physical reorganization of the array. The naive approach uses atomic shared cursors, causing intense cache line ping-ponging. The optimized strategy pre-calculates thread-local offsets to remove all memory synchronization.
-### HOW TO EXECUTE
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatter_Atomic -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
-``` 
-```bash 
-srun -w node07 --time=00:01:00 ./bin/hashjoin_par_partitioning_scatter -nr 20000000 -ns 20000000 -seed 42 -max-key 5000000 -p 256
+./tuning_chunkSize.sh
 ```
-Output to check: The _scatter_Atomic execution should be extremely slow due to thread stalling on memory synchronization. The optimized _scatter version should execute nearly 5x faster.
+Output to check: Look at the ">> [dataset_type] chunk-size=" section for each run or log_chunk_size_tuning.txt.
 
 # EXPERIMENT 3: Scalability
 Evaluates the overall application behavior as thread counts and workloads scale.
 ## HOW TO COMPILE
 ```bash 
-make parallel_final
+make parallel_omp_task_level_oversubscription_localjoin
+make parallel_omp_loop_level_join_adaptive_memory
 ```
 ## EXPERIMENT 3.1 - Strong Scalability
 Analyzes performance when the total problem size is kept constant while the number of threads increases.
 ### HOW TO EXECUTE
 ```bash 
-./strong_scalability.sh 
-``` 
-Output to check: log_detailed_strong_scalability.txt
+./strong_scalabilityLoopLevel.sh
+./strong_scalabilityTaskLevel.sh 
+```
+Output to check: The results of the experiments are written to a detailed log file and two CSV files containing the measured performance under uniform and skewed workloads. For the task-level implementation, the output consists of log_detailed_strong_scalability_tasklevel.txt, strong_scalability_uniform_tasklevel.csv, and strong_scalability_skewed_tasklevel.csv. For the loop-level implementation, the corresponding outputs are log_detailed_strong_scalability_looplevel.txt, strong_scalability_uniform_looplevel.csv, and strong_scalability_skewed_looplevel.csv.
 
 ## EXPERIMENT 3.2 - Weak Scalability
-Evaluates the system by increasing the problem size proportionately with the number of threads. The objective is to maintain a strictly constant computational workload per thread across the algorithm's three primary kernels. Total records, total partitions, and the key range are all scaled up.
+Evaluates the system by increasing the problem size proportionately with the number of threads.
 ### HOW TO EXECUTE
 ```bash 
-./weak_scalability.sh 
-``` 
-Output to check: log_detailed_weak_scalability.txt
+./weak_scalabilityLoopLevel.sh
+./weak_scalabilityTaskLevel.sh 
+```
+Output to check: The results of the weak scalability experiments are stored in a detailed log file together with two CSV files reporting performance under uniform and skewed workloads. For the task-level implementation, the outputs are log_detailed_weak_scalability_tasklevel.txt, weak_scalability_uniform_tasklevel.csv, and weak_scalability_skewed_tasklevel.csv. For the loop-level implementation, the corresponding files are log_detailed_weak_scalability_looplevel.txt, weak_scalability_uniform_looplevel.csv, and weak_scalability_skewed_looplevel.csv.
 
+
+
+# EXPERIMENT 4: Performance Comparison Across Sequential, C++ Threads, and OpenMP Implementations
+Compare the execution times of the sequential, C++ Threads, OpenMP Loop-Level, and OpenMP Task-Level implementations on uniform and skewed datasets to assess scalability and robustness under workload imbalance.
+## HOW TO COMPILE
+```bash 
+make seq
+make parallel_cpp
+make parallel_omp_task_level_oversubscription_localjoin
+make parallel_omp_loop_level_join_adaptive_memory
+```
+### HOW TO EXECUTE
+```bash 
+./bench_compare_all.sh
+```
+Output to check: The benchmark generates two CSV files (comparison_uniform.csv and comparison_skewed.csv) containing the median execution times and standard deviations for each phase of the hash join algorithm. In particular, compare the Build, Probe, Join Loop, and Total execution times across the Sequential, C++ Threads, OpenMP Loop-Level, and OpenMP Task-Level implementations to evaluate scalability, load balancing, and robustness under both uniform and skewed data distributions.
 
 
 

@@ -95,6 +95,19 @@ static bool read_arg_u64(int argc, char** argv, const std::string& name, std::ui
     }
     return false;
 }
+
+
+
+static bool read_arg_double(int argc, char** argv, const std::string& name, double& out) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (name == argv[i]) {
+            out = std::stod(argv[i + 1]);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void usage(const char* prog) {
     std::cerr
         << "Usage:\n"
@@ -104,7 +117,12 @@ static void usage(const char* prog) {
         << "  -ns         Number of records in relation S\n"
         << "  -seed       Deterministic seed\n"
         << "  -max-key    Keys are generated in [0, max-key)\n"
-        << "  -p          Number of partitions (power of two required in this reference code)\n";
+        << "  -p          Number of partitions (power of two required in this reference code)\n"
+        << "  -t          Number of threads (optional, default: number of hardware threads)\n"
+        << "  -chunk       Chunk size for parallel processing (optional, default: 1)\n"
+        << "  -buffer      Buffer size for parallel processing (optional, default: 64)\n"
+        << "  -sigma       Standard deviation for skewed data generation (optional, default: 0.0)\n"
+        << "  -subset-size Size of the subset to be analyzed (optional, default: 0)\n";
 }
 static bool is_power_of_two(std::uint32_t x) {
     return x != 0 && (x & (x - 1U)) == 0;
@@ -135,16 +153,132 @@ static inline std::uint64_t splitmix64_next(std::uint64_t& state) {
 }
 
 
-static std::vector<Record> generate_relation(std::size_t n, std::uint64_t seed, std::uint64_t max_key) {
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <random>
+
+
+static std::vector<Record> generate_relation(
+    std::size_t n, 
+    std::uint64_t seed, 
+    std::uint64_t max_key,
+    std::uint32_t num_partitions,        // P nel LaTeX
+    double skew_factor = 0.0,            // sigma (0.0 = totalmente uniforme)
+    std::uint32_t target_subset_size = 0,// M (dimensione del subset di partizioni hot)
+    double crest_shape = 1.0             // theta (1.0 = plateau uniforme, >1.0 = cresta appuntita verso l'indice 0)
+) {
     std::vector<Record> out(n);
     std::uint64_t state = seed;
 
+    // =================================================================
+    // SETUP: Creazione del subset "sparso" di partizioni
+    // =================================================================
+    std::vector<std::uint32_t> hot_partitions;
+    if (target_subset_size > 0 && skew_factor > 0.0) {
+        std::uint32_t actual_subset_size = std::min(target_subset_size, num_partitions);
+        hot_partitions.resize(actual_subset_size);
+
+        std::vector<std::uint32_t> all_parts(num_partitions);
+        std::iota(all_parts.begin(), all_parts.end(), 0);
+
+        // Mischiamo con un seed derivato per garantire la riproducibilità
+        std::mt19937_64 rng(seed + 0xDEADBEEF); 
+        std::shuffle(all_parts.begin(), all_parts.end(), rng);
+
+        for(std::uint32_t i = 0; i < actual_subset_size; ++i) {
+            hot_partitions[i] = all_parts[i];
+        }
+    }
+
     for (std::size_t i = 0; i < n; ++i) {
-        const std::uint64_t r = splitmix64_next(state);
-        out[i].key = (max_key == 0) ? 0ULL : (r % max_key);
+        if (max_key == 0) {
+            out[i].key = 0ULL;
+            continue;
+        }
+
+        // Estraiamo un valore uniforme u ~ U(0,1) per decidere la natura del record
+        std::uint64_t r_skew = splitmix64_next(state);
+        double u = static_cast<double>(r_skew) / static_cast<double>(-1ULL);
+
+        if (u < skew_factor && target_subset_size > 0) {
+            // =================================================================
+            // SKEWED PATH (Sintesi Deterministica)
+            // =================================================================
+            
+            // 1. Estraiamo un valore uniforme tra 0.0 e 1.0 per la scelta della partizione
+            std::uint64_t r_part = splitmix64_next(state);
+            double u_idx = static_cast<double>(r_part) / static_cast<double>(-1ULL);
+
+            // 2. Applichiamo la distorsione (Power-law) per creare la cresta
+            double skewed_u = std::pow(u_idx, crest_shape);
+
+            // 3. Calcoliamo l'indice schiacciato verso lo zero
+            std::uint32_t idx = static_cast<std::uint32_t>(skewed_u * hot_partitions.size());
+
+            // Controllo di sicurezza per evitare out-of-bounds (dovuti ad arrotondamenti float estremi)
+            if (idx >= hot_partitions.size()) {
+                idx = hot_partitions.size() - 1;
+            }
+            
+            // Estraiamo il vero ID della partizione (promosso a uint32_t)
+            std::uint32_t p_target = hot_partitions[idx];
+
+            if (max_key < (1ULL << 32)) {
+                // -------------------------------------------------------------
+                // CASE A: K_max < 2^32 (No XOR Cancellation)
+                // -------------------------------------------------------------
+                std::uint64_t max_multiples = max_key / num_partitions;
+
+                if (max_multiples == 0) {
+                    // Caso limite: K_max è più piccolo del numero di partizioni
+                    out[i].key = p_target % max_key;
+                } else {
+                    // R % max_multiples genera un valore in [0, (K_max/P) - 1]
+                    // equivalente a U(0, floor(K_max/P) - 1) ed evita underflow negativi
+                    std::uint64_t r_mult = splitmix64_next(state);
+                    std::uint64_t R = r_mult % max_multiples; 
+                    
+                    out[i].key = (R * num_partitions) + p_target;
+                }
+            } 
+            else {
+                // -------------------------------------------------------------
+                // CASE B: K_max >= 2^32 (Hierarchical Bounding & Cancellation)
+                // -------------------------------------------------------------
+                
+                // 1. Upper Half Generation (Assorbe il vincolo max_key)
+                std::uint64_t k_high_bound = max_key >> 32;
+                std::uint64_t r_high = splitmix64_next(state);
+                std::uint64_t k_high = r_high % k_high_bound; // Strettamente < K_max >> 32
+
+                // 2. Noise Extraction (O_high = k_high mod P)
+                std::uint64_t o_high = k_high % num_partitions;
+
+                // 3. Padding Generation (R ristretto rigorosamente nello spazio a 32 bit)
+                std::uint64_t max_multiples_32 = (1ULL << 32) / num_partitions;
+                std::uint64_t r_mult = splitmix64_next(state);
+                std::uint64_t R = r_mult % max_multiples_32; // Garantisce che k_low non sborderà mai nei 32 bit alti
+
+                // 4. Pre-emptive Cancellation (Anti-venom) & Low 32-bit Synthesis
+                std::uint64_t B = p_target ^ o_high;
+                std::uint64_t k_low = (R * num_partitions) + B;
+
+                // 5. 64-bit Assembly
+                out[i].key = (k_high << 32) | k_low;
+            }
+        } 
+        else {
+            // =================================================================
+            // UNIFORM PATH (Fallback logica originale)
+            // =================================================================
+            const std::uint64_t r = splitmix64_next(state);
+            out[i].key = r % max_key;
+        }
     }
     return out;
 }
+
 
 
 // ------------------------------------------------------------
@@ -285,13 +419,13 @@ static PrefixSumResult exclusive_prefix_sum_2d(
 //
 // This is a parallel scatter implementation that uses local buffers to minimize contention on the output array.
 // Each thread maintains a local buffer for each partition, and flushes it to the output array when it is full. This reduces the number of atomic operations and cache line contention on the output array.
-// The buffer size is chosen to fit within a cache line (e.g., 64 bytes) to optimize memory access patterns. 
-constexpr std::size_t BUFFER_SIZE = 8; 
+
 
 static std::vector<Record> scatter_parallel_optimized(
     const std::vector<Record>& rel,
     std::uint32_t p,
     std::uint32_t num_threads,
+    std::uint64_t buffer_size,
     const std::vector<std::vector<std::size_t>>& thread_offsets)
 {
     // Output array for scattered records
@@ -301,12 +435,12 @@ static std::vector<Record> scatter_parallel_optimized(
     threads.reserve(num_threads);
 
     // Worker function for each thread to scatter records into the output array
-    auto worker = [&, num_threads](std::uint32_t threadid)
+    auto worker = [&, num_threads, buffer_size](std::uint32_t threadid)
     {
         // ---------------------------
         // 1. LOCAL BUFFERS
         // ---------------------------
-        std::vector<Record> local_buffer(p * BUFFER_SIZE);
+        std::vector<Record> local_buffer(p * buffer_size);
         std::vector<std::size_t> buffer_counts(p, 0);
         
         // my_next[pid] will be the next write position for thread threadid to write records of partition pid.
@@ -331,19 +465,19 @@ static std::vector<Record> scatter_parallel_optimized(
             const std::uint32_t pid = compute_partition_id(rel[i].key, p);
 
             // Write the record to the local buffer for this partition
-            auto& buf = local_buffer[pid * BUFFER_SIZE + buffer_counts[pid]];
+            auto& buf = local_buffer[pid * buffer_size + buffer_counts[pid]];
             buf = rel[i];
 
             // Increment the buffer count for this partition. If the buffer is full, flush it to the output array.
-            if (++buffer_counts[pid] == BUFFER_SIZE)
+            if (++buffer_counts[pid] == buffer_size)
             {
                 std::memcpy(
                     &out[my_next[pid]],
-                    &local_buffer[pid * BUFFER_SIZE],
-                    BUFFER_SIZE * sizeof(Record)
+                    &local_buffer[pid * buffer_size],
+                    buffer_size * sizeof(Record)
                 );
 
-                my_next[pid] += BUFFER_SIZE;
+                my_next[pid] += buffer_size;
                 buffer_counts[pid] = 0;
             }
         }
@@ -358,7 +492,7 @@ static std::vector<Record> scatter_parallel_optimized(
             {
                 std::memcpy(
                     &out[my_next[pid]],
-                    &local_buffer[pid * BUFFER_SIZE],
+                    &local_buffer[pid * buffer_size],
                     buffer_counts[pid] * sizeof(Record)
                 );
             }
@@ -410,7 +544,7 @@ struct PartitionedRelation {
 // After this phase, all records belonging to the same partition
 // are stored contiguously in memory, enabling independent processing.
 //
-static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, std::uint32_t num_threads, PhaseTiming::PartitionPhase& T_part) {
+static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, std::uint32_t num_threads, std::uint64_t buffer_size, PhaseTiming::PartitionPhase& T_part) {
     std::vector<std::vector<std::size_t>> local_hists;
     PrefixSumResult prefix_res;
     std::vector<std::size_t> end(p);
@@ -428,7 +562,7 @@ static PartitionedRelation partition_relation(const std::vector<Record>& rel, st
 
     {
         ScopedTimer t(T_part.scatter);
-        data = scatter_parallel_optimized(rel, p, num_threads, prefix_res.thread_offsets);
+        data = scatter_parallel_optimized(rel, p, num_threads, buffer_size, prefix_res.thread_offsets);
     }
 
     {
@@ -547,12 +681,13 @@ struct alignas(64) AlignedPhaseTiming {
     PhaseTiming data;
 };
 
-static JoinResult partitioned_hash_join_sequential(
+static JoinResult partitioned_hash_join(
     const std::vector<Record>& R,
     const std::vector<Record>& S,
     std::uint32_t p,
     std::uint32_t num_threads,
     std::uint32_t chunk_size,
+    std::uint32_t buffer_size,
     PhaseTiming& T)
 {
     JoinResult total{};
@@ -563,7 +698,7 @@ static JoinResult partitioned_hash_join_sequential(
     PartitionedRelation Rpart;
     {
         ScopedTimer t(T.R.total);
-        Rpart = partition_relation(R, p, num_threads, T.R);
+        Rpart = partition_relation(R, p, num_threads, buffer_size,T.R);
     }
 
     // -------------------------
@@ -572,7 +707,7 @@ static JoinResult partitioned_hash_join_sequential(
     PartitionedRelation Spart;
     {
         ScopedTimer t(T.S.total);
-        Spart = partition_relation(S, p, num_threads, T.S);
+        Spart = partition_relation(S, p, num_threads, buffer_size, T.S);
     }
 
     // -------------------------
@@ -669,26 +804,286 @@ static JoinResult naive_join_verifier(const std::vector<Record>& R,
 }
 
 // ------------------------------------------------------------
+// Full sequential partitioned hash join (for correctness checking)
+// ------------------------------------------------------------
+// Histogram
+// ------------------------------------------------------------
+//
+// Count how many records go to each partition.
+//
+// hist[pid] = number of records whose key maps to pid
+//
+static std::vector<std::size_t> compute_histogram(const std::vector<Record>& rel, std::uint32_t p) {
+    std::vector<std::size_t> hist(p, 0);
+
+    for (const auto& rec : rel) {
+        const std::uint32_t pid = compute_partition_id(rec.key, p);
+        ++hist[pid];
+    }
+    
+    return hist;
+}
+
+// ------------------------------------------------------------
+// Prefix sum (exclusive scan)
+// ------------------------------------------------------------
+//
+// Given a histogram, compute the begin offsets of each partition.
+//
+// Example:
+//   hist  = [0, 1, 2, 5]
+//   begin = [0, 0, 1, 3]
+//
+// Then partition p occupies [begin[p], begin[p] + hist[p]).
+//
+static std::vector<std::size_t> exclusive_prefix_sum(const std::vector<std::size_t>& hist) {
+    std::vector<std::size_t> begin(hist.size(), 0);
+
+    std::size_t running = 0;
+    for (std::size_t p = 0; p < hist.size(); ++p) {
+        begin[p] = running;
+        running += hist[p];
+    }
+    return begin;
+}
+
+// ------------------------------------------------------------
+// Scatter into a partitioned array
+// ------------------------------------------------------------
+//
+// Reorder records so that all records belonging to the same partition become
+// contiguous in memory.
+//
+// We use a write cursor per partition, initialized from the begin offsets.
+//
+static std::vector<Record> scatter_partitioned(const std::vector<Record>& rel,
+                                               std::uint32_t p,
+                                               const std::vector<std::size_t>& begin) {
+    std::vector<Record> out(rel.size());
+
+    // Current write position for each partition.
+    std::vector<std::size_t> next = begin;
+
+    for (const auto& rec : rel) {
+        const std::uint32_t pid = compute_partition_id(rec.key, p);
+        out[next[pid]++] = rec;
+    }
+
+    return out;
+}
+
+
+// ------------------------------------------------------------
+// Full partitioning pipeline for one relation
+// ------------------------------------------------------------
+//
+// This groups together the steps:
+//   histogram -> prefix sum -> scatter -> end offsets
+//
+// After this phase, all records belonging to the same partition
+// are stored contiguously in memory, enabling independent processing.
+//
+static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, PhaseTiming::PartitionPhase& T_part) {
+    std::vector<std::size_t> hist;
+    std::vector<std::size_t> begin;
+    std::vector<Record> data;
+    std::vector<std::size_t> end(p);
+
+    {
+        ScopedTimer t(T_part.histogram);
+        hist = compute_histogram(rel, p);
+    }
+
+    {
+        ScopedTimer t(T_part.prefix);
+        begin = exclusive_prefix_sum(hist);
+    }
+
+    {
+        ScopedTimer t(T_part.scatter);
+        data = scatter_partitioned(rel, p, begin);
+    }
+
+    {
+        ScopedTimer t(T_part.end);
+        for (std::uint32_t i = 0; i < p; i++) {
+            end[i] = begin[i] + hist[i];
+        }
+    }
+
+    return PartitionedRelation{
+        .data = std::move(data),
+        .begin = begin,
+        .end = end
+    };
+}
+
+
+
+// ------------------------------------------------------------
+// Local join on one partition
+// ------------------------------------------------------------
+//
+// We process one partition p as follows:
+//
+//   Build:
+//     Scan R_p and compute countR[key]
+//
+//   Probe:
+//     Scan S_p
+//     If key k is present in countR, then each occurrence in S_p matches
+//     countR[k] occurrences in R_p.
+//
+// Duplicates are handled by counting occurrences in R.
+// Each record in S contributes as many matches as the multiplicity
+// of its key in the corresponding partition of R.
+//
+static JoinResult join_one_partition(const PartitionedRelation& Rpart,
+                                     const PartitionedRelation& Spart,
+                                     std::uint32_t pid,
+                                     PhaseTiming& T) {
+    JoinResult result{};
+
+    const std::size_t r_begin = Rpart.begin[pid];
+    const std::size_t r_end = Rpart.end[pid];
+    const std::size_t s_begin = Spart.begin[pid];
+    const std::size_t s_end = Spart.end[pid];
+
+    // Nothing to do if either partition is empty.
+    if (r_begin == r_end || s_begin == s_end) {
+        return result;
+    }
+
+    // Build phase:
+    // count how many times each key appears in R_p.
+	//
+    ska::flat_hash_map<std::uint64_t, std::uint32_t> countR;
+    countR.reserve((r_end - r_begin) * 2);
+
+    {
+        ScopedTimer t(T.build);
+        for (std::size_t i = r_begin; i < r_end; ++i) {
+            ++countR[Rpart.data[i].key];
+        }
+    }
+
+
+    // Probe phase:
+    // for each key in S_p, if it exists in countR, add countR[key] matches.
+    {
+        ScopedTimer t(T.probe);
+        for (std::size_t i = s_begin; i < s_end; ++i) {
+            const std::uint64_t key = Spart.data[i].key;
+            const auto it = countR.find(key);
+            if (it != countR.end()) {
+                const std::uint64_t multiplicity = it->second;
+
+                result.join_count += multiplicity;
+                result.checksum1 += splitmix64(key) * multiplicity;
+                result.checksum2 += splitmix64(key ^ 0x9e3779b97f4a7c15ULL) * multiplicity;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ------------------------------------------------------------
+// Full sequential partitioned hash join
+// ------------------------------------------------------------
+//
+// This is the end-to-end baseline:
+//
+//   1. Partition R
+//   2. Partition S
+//   3. For each partition p:
+//        local build + local probe
+//   4. Accumulate results
+//
+// Each partition can be processed independently.
+// This property is the basis for parallelization in Module 2.
+//
+static JoinResult partitioned_hash_join_sequential(
+    const std::vector<Record>& R,
+    const std::vector<Record>& S,
+    std::uint32_t p,
+    PhaseTiming& T)
+{
+    JoinResult total{};
+
+    // -------------------------
+    // Phase 1: partitioning R
+    // -------------------------
+    PartitionedRelation Rpart;
+    {
+        ScopedTimer t(T.R.total);
+        Rpart = partition_relation(R, p, T.R);
+    }
+
+    // -------------------------
+    // Phase 2: partitioning S
+    // -------------------------
+    PartitionedRelation Spart;
+    {
+        ScopedTimer t(T.S.total);
+        Spart = partition_relation(S, p, T.S);
+    }
+
+    // -------------------------
+    // Phase 3: join phase
+    // -------------------------
+    {
+        ScopedTimer t(T.join_loop);
+
+        for (std::uint32_t pid = 0; pid < p; ++pid) {
+            JoinResult local = join_one_partition(Rpart, Spart, pid, T);
+
+            total.join_count += local.join_count;
+            total.checksum1  += local.checksum1;
+            total.checksum2  += local.checksum2;
+        }
+    }
+
+    return total;
+}
+
+
+
+
+
+// ------------------------------------------------------------
 // Main
 // ------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, chunk_size = 1;
-    int nthreads=std::thread::hardware_concurrency();
+    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, chunk_size = 1, subset_size = 0;
+    double sigma = 0.0, crest_shape = 1.0;
+    int nthreads = std::thread::hardware_concurrency();
+    std::uint64_t buffer_size = 64;
+
+    if (nthreads == 0) nthreads = 1;
 
 
     if (!read_arg_u64(argc, argv, "-nr", nr) ||
         !read_arg_u64(argc, argv, "-ns", ns) ||
         !read_arg_u64(argc, argv, "-seed", seed) ||
         !read_arg_u64(argc, argv, "-max-key", max_key) ||
-        !read_arg_u64(argc, argv, "-p", p)) {
+        !read_arg_u64(argc, argv, "-p", p) ||
+        !read_arg_double(argc, argv, "-sigma", sigma) ||
+        !read_arg_u64(argc, argv, "-subset-size", subset_size) ||
+        !read_arg_double(argc, argv, "-crest-shape", crest_shape)) {
         usage(argv[0]);
         return 1;
     }
-
+    std::uint64_t t_input = 0;
+    if (read_arg_u64(argc, argv, "-t", t_input)) {
+        nthreads = static_cast<int>(t_input);
+    }
+    
     read_arg_u64(argc, argv, "-chunk", chunk_size);
+    read_arg_u64(argc, argv, "-buffer", buffer_size);
 
-    if (p > std::numeric_limits<std::uint32_t>::max()) {
-        std::cerr << "Error: P too large.\n";
+    if (nthreads <= 0) {
+        std::cerr << "Error: Number of threads must be at least 1.\n";
         return 1;
     }
 
@@ -708,8 +1103,8 @@ int main(int argc, char** argv) {
 
     // Deterministic generation.
     // We use two different seeds so that R and S are not identical.
-    const auto R = generate_relation(NR, seed, max_key);
-    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key);
+    const auto R = generate_relation(NR, seed, max_key, P, sigma, subset_size, crest_shape);
+    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key, P, sigma, subset_size, crest_shape);
 
     const int RUNS = 10;
 
@@ -722,7 +1117,7 @@ int main(int argc, char** argv) {
         PhaseTiming T;
 
         const auto t0 = std::chrono::steady_clock::now();
-        JoinResult r = partitioned_hash_join_sequential(R, S, P, nthreads, chunk_size, T);
+        JoinResult r = partitioned_hash_join(R, S, P, nthreads, chunk_size, buffer_size, T);
         const auto t1 = std::chrono::steady_clock::now();
 
         T.total = std::chrono::duration<double>(t1 - t0).count();
@@ -735,7 +1130,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Utility to extract a vector of timings for a specific phase from the collected times.
+    // Utility to extract timing data for statistics printing.
     auto extract = [&](auto getter) {
         std::vector<double> v;
         v.reserve(times.size());
@@ -747,7 +1142,7 @@ int main(int argc, char** argv) {
 
     const JoinResult& result = results.back();
 
-
+    std::cout << "\n========== Parallel version ==========\n";
     std::cout << "NR=" << NR << " NS=" << NS << " P=" << P
               << " seed=" << seed
               << " [0, " << max_key << ")\n";
@@ -759,6 +1154,20 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(6);
 
     if (NR <= 500 && NS <= 500) {
+        const JoinResult naive = naive_join_verifier(R, S);
+        std::cout << "naive_join_count=" << naive.join_count << "\n";
+        std::cout << "naive_checksum1=" << naive.checksum1 << "\n";
+        std::cout << "naive_checksum2=" << naive.checksum2 << "\n";
+    }
+
+    
+    std::cout << "\n========== Sequential version (check for correcteness) ==========\n";
+    PhaseTiming T;
+    JoinResult r = partitioned_hash_join_sequential(R, S, P, T);
+    std::cout << "join_count=" << r.join_count << "\n";
+    std::cout << "checksum1=" << r.checksum1 << "\n";
+    std::cout << "checksum2=" << r.checksum2 << "\n";
+    if(NR <= 500 && NS <= 500) {
         const JoinResult naive = naive_join_verifier(R, S);
         std::cout << "naive_join_count=" << naive.join_count << "\n";
         std::cout << "naive_checksum1=" << naive.checksum1 << "\n";

@@ -72,6 +72,32 @@
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include <omp.h>
+
+
+enum class OmpSchedule {
+    STATIC,
+    DYNAMIC,
+    GUIDED,
+    AUTO
+};
+inline void set_schedule(OmpSchedule s, int chunk_size)
+{
+    switch (s) {
+        case OmpSchedule::STATIC:
+            omp_set_schedule(omp_sched_static, chunk_size);
+            break;
+        case OmpSchedule::DYNAMIC:
+            omp_set_schedule(omp_sched_dynamic, chunk_size);
+            break;
+        case OmpSchedule::GUIDED:
+            omp_set_schedule(omp_sched_guided, chunk_size);
+            break;
+        case OmpSchedule::AUTO:
+            omp_set_schedule(omp_sched_auto, 0);
+            break;
+    }
+}
 // ------------------------------------------------------------
 // Record definition
 // ------------------------------------------------------------
@@ -95,6 +121,30 @@ static bool read_arg_u64(int argc, char** argv, const std::string& name, std::ui
     }
     return false;
 }
+
+
+static bool read_arg_double(int argc, char** argv, const std::string& name, double& out) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (name == argv[i]) {
+            out = std::stod(argv[i + 1]);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool read_arg_string(int argc, char** argv, const std::string& name, std::string& out) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (name == argv[i]) {
+            out = argv[i + 1];
+            return true;
+        }
+    }
+    return false;
+}
+
+
+
 static void usage(const char* prog) {
     std::cerr
         << "Usage:\n"
@@ -104,7 +154,9 @@ static void usage(const char* prog) {
         << "  -ns         Number of records in relation S\n"
         << "  -seed       Deterministic seed\n"
         << "  -max-key    Keys are generated in [0, max-key)\n"
-        << "  -p          Number of partitions (power of two required in this reference code)\n";
+        << "  -p          Number of partitions (power of two required in this reference code)\n"
+        << "  -sigma      Skew factor (0.0 = uniform, 1.0 = fully skewed)\n"
+        << "  -subset-size Size of the hot subset (0 = all partitions)\n";;
 }
 static bool is_power_of_two(std::uint32_t x) {
     return x != 0 && (x & (x - 1U)) == 0;
@@ -134,14 +186,128 @@ static inline std::uint64_t splitmix64_next(std::uint64_t& state) {
     return splitmix64_mix(state);
 }
 
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <random>
 
-static std::vector<Record> generate_relation(std::size_t n, std::uint64_t seed, std::uint64_t max_key) {
+
+static std::vector<Record> generate_relation(
+    std::size_t n, 
+    std::uint64_t seed, 
+    std::uint64_t max_key,
+    std::uint32_t num_partitions,        // P nel LaTeX
+    double skew_factor = 0.0,            // sigma (0.0 = totalmente uniforme)
+    std::uint32_t target_subset_size = 0,// M (dimensione del subset di partizioni hot)
+    double crest_shape = 1.0             // theta (1.0 = plateau uniforme, >1.0 = cresta appuntita verso l'indice 0)
+) {
     std::vector<Record> out(n);
     std::uint64_t state = seed;
 
+    // =================================================================
+    // SETUP: Creazione del subset "sparso" di partizioni
+    // =================================================================
+    std::vector<std::uint32_t> hot_partitions;
+    if (target_subset_size > 0 && skew_factor > 0.0) {
+        std::uint32_t actual_subset_size = std::min(target_subset_size, num_partitions);
+        hot_partitions.resize(actual_subset_size);
+
+        std::vector<std::uint32_t> all_parts(num_partitions);
+        std::iota(all_parts.begin(), all_parts.end(), 0);
+
+        // Mischiamo con un seed derivato per garantire la riproducibilità
+        std::mt19937_64 rng(seed + 0xDEADBEEF); 
+        std::shuffle(all_parts.begin(), all_parts.end(), rng);
+
+        for(std::uint32_t i = 0; i < actual_subset_size; ++i) {
+            hot_partitions[i] = all_parts[i];
+        }
+    }
+
     for (std::size_t i = 0; i < n; ++i) {
-        const std::uint64_t r = splitmix64_next(state);
-        out[i].key = (max_key == 0) ? 0ULL : (r % max_key);
+        if (max_key == 0) {
+            out[i].key = 0ULL;
+            continue;
+        }
+
+        // Estraiamo un valore uniforme u ~ U(0,1) per decidere la natura del record
+        std::uint64_t r_skew = splitmix64_next(state);
+        double u = static_cast<double>(r_skew) / static_cast<double>(-1ULL);
+
+        if (u < skew_factor && target_subset_size > 0) {
+            // =================================================================
+            // SKEWED PATH (Sintesi Deterministica)
+            // =================================================================
+            
+            // 1. Estraiamo un valore uniforme tra 0.0 e 1.0 per la scelta della partizione
+            std::uint64_t r_part = splitmix64_next(state);
+            double u_idx = static_cast<double>(r_part) / static_cast<double>(-1ULL);
+
+            // 2. Applichiamo la distorsione (Power-law) per creare la cresta
+            double skewed_u = std::pow(u_idx, crest_shape);
+
+            // 3. Calcoliamo l'indice schiacciato verso lo zero
+            std::uint32_t idx = static_cast<std::uint32_t>(skewed_u * hot_partitions.size());
+
+            // Controllo di sicurezza per evitare out-of-bounds (dovuti ad arrotondamenti float estremi)
+            if (idx >= hot_partitions.size()) {
+                idx = hot_partitions.size() - 1;
+            }
+            
+            // Estraiamo il vero ID della partizione (promosso a uint32_t)
+            std::uint32_t p_target = hot_partitions[idx];
+
+            if (max_key < (1ULL << 32)) {
+                // -------------------------------------------------------------
+                // CASE A: K_max < 2^32 (No XOR Cancellation)
+                // -------------------------------------------------------------
+                std::uint64_t max_multiples = max_key / num_partitions;
+
+                if (max_multiples == 0) {
+                    // Caso limite: K_max è più piccolo del numero di partizioni
+                    out[i].key = p_target % max_key;
+                } else {
+                    // R % max_multiples genera un valore in [0, (K_max/P) - 1]
+                    // equivalente a U(0, floor(K_max/P) - 1) ed evita underflow negativi
+                    std::uint64_t r_mult = splitmix64_next(state);
+                    std::uint64_t R = r_mult % max_multiples; 
+                    
+                    out[i].key = (R * num_partitions) + p_target;
+                }
+            } 
+            else {
+                // -------------------------------------------------------------
+                // CASE B: K_max >= 2^32 (Hierarchical Bounding & Cancellation)
+                // -------------------------------------------------------------
+                
+                // 1. Upper Half Generation (Assorbe il vincolo max_key)
+                std::uint64_t k_high_bound = max_key >> 32;
+                std::uint64_t r_high = splitmix64_next(state);
+                std::uint64_t k_high = r_high % k_high_bound; // Strettamente < K_max >> 32
+
+                // 2. Noise Extraction (O_high = k_high mod P)
+                std::uint64_t o_high = k_high % num_partitions;
+
+                // 3. Padding Generation (R ristretto rigorosamente nello spazio a 32 bit)
+                std::uint64_t max_multiples_32 = (1ULL << 32) / num_partitions;
+                std::uint64_t r_mult = splitmix64_next(state);
+                std::uint64_t R = r_mult % max_multiples_32; // Garantisce che k_low non sborderà mai nei 32 bit alti
+
+                // 4. Pre-emptive Cancellation (Anti-venom) & Low 32-bit Synthesis
+                std::uint64_t B = p_target ^ o_high;
+                std::uint64_t k_low = (R * num_partitions) + B;
+
+                // 5. 64-bit Assembly
+                out[i].key = (k_high << 32) | k_low;
+            }
+        } 
+        else {
+            // =================================================================
+            // UNIFORM PATH (Fallback logica originale)
+            // =================================================================
+            const std::uint64_t r = splitmix64_next(state);
+            out[i].key = r % max_key;
+        }
     }
     return out;
 }
@@ -183,35 +349,19 @@ static std::vector<std::vector<std::size_t>> compute_histogram_matrix(
     // and then we can aggregate them later.
     std::vector<std::vector<std::size_t>> local_hists(num_threads, std::vector<std::size_t>(p, 0));
 
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
+    #pragma omp parallel default(none) \
+        shared(local_hists, rel, p) \
+        num_threads(num_threads)
+    {
+        int tid = omp_get_thread_num();
+        auto& my_hist = local_hists[tid];
 
-    // block-based partitioning: each thread processes a contiguous block of records
-    auto block_based = [&](int threadid) {
-        // Each thread computes its own local histogram for its assigned block of records.
-        std::size_t total_records = rel.size();
-        std::size_t parts_per_thread = total_records / num_threads;
-        std::size_t rem = total_records % num_threads;
-        
-        // Compute the range of records this thread will process
-        std::size_t lower = threadid * parts_per_thread + std::min(static_cast<std::size_t>(threadid), rem);
-        std::size_t upper = lower + parts_per_thread + (threadid < static_cast<int>(rem) ? 1 : 0);
-
-        // Compute local histogram for the assigned block of records
-        auto& my_hist = local_hists[threadid];
-        for (std::size_t i = lower; i < upper; ++i) {
+        #pragma omp for schedule(static)
+        for (std::size_t i = 0; i < rel.size(); ++i) {
             std::uint32_t pid = compute_partition_id(rel[i].key, p);
             my_hist[pid]++; 
         }
-    };
-
-    // Launch threads to compute local histograms in parallel
-    for (std::uint32_t id = 0; id < num_threads; ++id) {
-        threads.emplace_back([&, threadid = id]() { block_based(threadid); });
     }
-    // Wait for all threads to finish
-    for (auto& t : threads) { t.join(); }
-
     // Aggregate local histograms into the final histogram
     // This step is done sequentially after all threads have completed their local histograms.
     // We iterate over each partition and sum the counts from all threads for that partition.
@@ -219,6 +369,9 @@ static std::vector<std::vector<std::size_t>> compute_histogram_matrix(
     // The final result is a 2D histogram matrix where each row corresponds to a thread
     return local_hists;
 }
+
+
+
 
 // ------------------------------------------------------------
 // Prefix sum (exclusive scan)
@@ -286,9 +439,10 @@ static PrefixSumResult exclusive_prefix_sum_2d(
 // This is a parallel scatter implementation that uses local buffers to minimize contention on the output array.
 // Each thread maintains a local buffer for each partition, and flushes it to the output array when it is full. This reduces the number of atomic operations and cache line contention on the output array.
 // The buffer size is chosen to fit within a cache line (e.g., 64 bytes) to optimize memory access patterns. 
-constexpr std::size_t BUFFER_SIZE = 8; 
 
-static std::vector<Record> scatter_parallel_optimized(
+constexpr std::size_t BUFFER_SIZE = 64 ; 
+
+static std::vector<Record> scatter_omp_parallel(
     const std::vector<Record>& rel,
     std::uint32_t p,
     std::uint32_t num_threads,
@@ -297,91 +451,41 @@ static std::vector<Record> scatter_parallel_optimized(
     // Output array for scattered records
     std::vector<Record> out(rel.size());
     
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    // Worker function for each thread to scatter records into the output array
-    auto worker = [&, num_threads](std::uint32_t threadid)
+    // Parallel scatter using OpenMP
+    #pragma omp parallel num_threads(num_threads) \
+        default(none) shared(rel, out, p, thread_offsets)
     {
-        // ---------------------------
-        // 1. LOCAL BUFFERS
-        // ---------------------------
+        // Each thread maintains a local buffer for each partition to reduce contention on the output array.
+        int tid = omp_get_thread_num();
         std::vector<Record> local_buffer(p * BUFFER_SIZE);
         std::vector<std::size_t> buffer_counts(p, 0);
-        
-        // my_next[pid] will be the next write position for thread threadid to write records of partition pid.
-        std::vector<std::size_t> my_next = thread_offsets[threadid];
+        std::vector<std::size_t> my_next = thread_offsets[tid];
 
-        // ---------------------------
-        // 2. COMPUTE RANGE
-        // ---------------------------
-        const std::size_t total = rel.size();
-        const std::size_t base = total / num_threads;
-        const std::size_t rem  = total % num_threads;
-
-        const std::size_t tid = threadid;
-        const std::size_t lower = tid * base + std::min<std::size_t>(tid, rem);
-        const std::size_t upper = lower + base + (tid < rem ? 1 : 0);
-
-        // ---------------------------
-        // 3. CORE LOOP
-        // ---------------------------
-        for (std::size_t i = lower; i < upper; ++i)
-        {
+        // Each thread processes a portion of the input relation and scatters records into the output array using its local buffer. 
+        // When a local buffer for a partition is full, it is flushed to the output array, and the corresponding write cursor is updated.
+        #pragma omp for schedule(static)
+        for (std::size_t i = 0; i < rel.size(); ++i) {
             const std::uint32_t pid = compute_partition_id(rel[i].key, p);
+            local_buffer[pid * BUFFER_SIZE + buffer_counts[pid]] = rel[i];
 
-            // Write the record to the local buffer for this partition
-            auto& buf = local_buffer[pid * BUFFER_SIZE + buffer_counts[pid]];
-            buf = rel[i];
-
-            // Increment the buffer count for this partition. If the buffer is full, flush it to the output array.
-            if (++buffer_counts[pid] == BUFFER_SIZE)
-            {
-                std::memcpy(
-                    &out[my_next[pid]],
-                    &local_buffer[pid * BUFFER_SIZE],
-                    BUFFER_SIZE * sizeof(Record)
-                );
-
+            if (++buffer_counts[pid] == BUFFER_SIZE) {
+                std::memcpy(&out[my_next[pid]], &local_buffer[pid * BUFFER_SIZE], BUFFER_SIZE * sizeof(Record));
                 my_next[pid] += BUFFER_SIZE;
                 buffer_counts[pid] = 0;
             }
         }
 
-        // ---------------------------
-        // 4. FLUSH FINALE
-        // ---------------------------
-        // After processing all records, we need to flush any remaining records in the local buffers to the output array.
-        for (std::uint32_t pid = 0; pid < p; ++pid)
-        {
-            if (buffer_counts[pid] > 0)
-            {
-                std::memcpy(
-                    &out[my_next[pid]],
-                    &local_buffer[pid * BUFFER_SIZE],
-                    buffer_counts[pid] * sizeof(Record)
-                );
+        // Flush finale
+        for (std::uint32_t pid = 0; pid < p; ++pid) {
+            if (buffer_counts[pid] > 0) {
+                std::memcpy(&out[my_next[pid]], &local_buffer[pid * BUFFER_SIZE], buffer_counts[pid] * sizeof(Record));
             }
         }
-    };
-
-    // ---------------------------
-    // 5. SPAWN & JOIN THREADS
-    // ---------------------------
-    for (std::uint32_t id = 0; id < num_threads; ++id)
-    {
-        threads.emplace_back(worker, id);
     }
-
-    // Wait for all threads to finish
-    for (auto& t : threads)
-    {
-        t.join();
-    }
-
     // After all threads have completed, the output array 'out' contains the scattered records, where records belonging to the same partition are stored contiguously. We can return this array as the result of the scatter phase.
     return out;
 }
+
 
 // ------------------------------------------------------------
 // Partitioned relation metadata
@@ -428,7 +532,7 @@ static PartitionedRelation partition_relation(const std::vector<Record>& rel, st
 
     {
         ScopedTimer t(T_part.scatter);
-        data = scatter_parallel_optimized(rel, p, num_threads, prefix_res.thread_offsets);
+        data = scatter_omp_parallel(rel, p, num_threads, prefix_res.thread_offsets);
     }
 
     {
@@ -477,7 +581,7 @@ static JoinResult join_one_partition_optimized(const PartitionedRelation& Rpart,
                                      const PartitionedRelation& Spart,
                                      std::uint32_t pid,
                                      PhaseTiming& T,
-                                    ska::flat_hash_map<std::uint64_t, std::uint32_t>& countR) {
+                                     ska::flat_hash_map<std::uint64_t, std::uint32_t>& countR) {
     JoinResult result{};
 
     const std::size_t r_begin = Rpart.begin[pid];
@@ -491,9 +595,27 @@ static JoinResult join_one_partition_optimized(const PartitionedRelation& Rpart,
     }
 
 
-    countR.clear();
-    countR.reserve((r_end - r_begin) * 2);
+    std::size_t current_r_size = r_end - r_begin;
+    std::size_t needed_buckets = current_r_size * 2; // load factor ~0.5
 
+    if (countR.bucket_count() > needed_buckets) {
+        // La mappa è sovradimensionata — distruggiamo e ricreiamo
+        // della dimensione giusta. Costo pagato una volta sola.
+        ska::flat_hash_map<std::uint64_t, std::uint32_t> fresh;
+        fresh.reserve(current_r_size);
+        countR.swap(fresh);
+        // fresh (con la memoria vecchia) distrutta qui
+    } else {
+        // La mappa è già della dimensione giusta o più piccola.
+        // clear() è O(bucket_count()) ma bucket_count() <= needed_buckets
+        // quindi è proporzionale alla partizione corrente — accettabile.
+        countR.clear();
+        // reserve qui è utile solo se la mappa è più piccola del necessario
+        // (prima partizione o dopo uno swap su partizione minuscola)
+        countR.reserve(current_r_size);
+    }
+
+    // Build phase:
     {
         ScopedTimer t(T.build);
         for (std::size_t i = r_begin; i < r_end; ++i) {
@@ -547,12 +669,11 @@ struct alignas(64) AlignedPhaseTiming {
     PhaseTiming data;
 };
 
-static JoinResult partitioned_hash_join_sequential(
+static JoinResult partitioned_hash_join(
     const std::vector<Record>& R,
     const std::vector<Record>& S,
     std::uint32_t p,
     std::uint32_t num_threads,
-    std::uint32_t chunk_size,
     PhaseTiming& T)
 {
     JoinResult total{};
@@ -580,65 +701,57 @@ static JoinResult partitioned_hash_join_sequential(
     // ------------------------
     std::vector<AlignedJoinResult> thread_results(num_threads);
     std::vector<AlignedPhaseTiming> thread_timings(num_threads);
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
 
     {
         ScopedTimer t(T.join_loop); 
 
-        // Block-cyclic distribution strategy
-        auto block_cyclic = [&](int threadid) {
-            std::uint32_t offset = threadid * chunk_size;
-            std::uint32_t stride = num_threads * chunk_size;
+        // Regione parallela SENZA reduction o critical
+        #pragma omp parallel num_threads(num_threads) \
+            default(none) shared(Rpart, Spart, T, R, thread_results, thread_timings, p, std::cout)       
 
-            // local accumulators for this thread
+        {
+            // Ogni thread recupera il suo ID per sapere dove scrivere a fine lavoro
+            int threadid = omp_get_thread_num();
+
+            // Accumulatori strettamente locali (allocati sui registri/stack del thread)
             JoinResult local_total{};
             PhaseTiming local_timing{}; 
 
-
             ska::flat_hash_map<std::uint64_t, std::uint32_t> thread_map;
-            // Reserve space in the hash map to avoid dynamic resizing during the join phase, which can be costly.
             thread_map.reserve((R.size() / p) * 2);
 
-            for (std::uint32_t lower = offset; lower < p; lower += stride) {
-                std::uint32_t upper = std::min(lower + chunk_size, p);
-                for (std::uint32_t pid = lower; pid < upper; ++pid) {
-                    // Process partition pid and accumulate results in local_total and local_timing
-                    JoinResult local = join_one_partition_optimized(Rpart, Spart, pid, local_timing, thread_map);
+            // OpenMP distribuisce le partizioni ai thread in modo dinamico.
+            // I thread pescano partizioni dalla coda senza collisioni.
+            #pragma omp for schedule(runtime) \
+                nowait // Evitiamo la barriera implicita alla fine del for, perché ogni thread salva i risultati nel proprio slot sicuro dell'array.
+            for (std::uint32_t pid = 0; pid < p; ++pid) {
                     
-                    // Accumulate results in local_total to minimize the number of writes to the shared thread_results array, which can cause contention.
-                    local_total.join_count += local.join_count;
-                    local_total.checksum1  += local.checksum1;
-                    local_total.checksum2  += local.checksum2;
-                }
+                JoinResult local = join_one_partition_optimized(Rpart, Spart, pid, local_timing, thread_map);
+                
+                // Accumuliamo nelle variabili locali del thread
+                local_total.join_count += local.join_count;
+                local_total.checksum1  += local.checksum1;
+                local_total.checksum2  += local.checksum2;
+
             }
-            
-            // Store results in the thread-specific array
-            // Writing the final results to the shared thread_results array only once per thread helps to reduce contention
+
+            // A fine lavoro (quando non ci sono più partizioni da processare),
+            // ogni thread salva i suoi totali nel proprio slot sicuro dell'array.
             thread_results[threadid].data = local_total;
             thread_timings[threadid].data = local_timing;
-        };
-
-        // Spawn threads
-        for (std::uint32_t id = 0; id < num_threads; ++id) {
-            threads.emplace_back([&, threadid = id]() {
-                block_cyclic(threadid);
-            });
-        }
-
-        // Wait for all threads to finish
-        for (auto& thread : threads) {
-            thread.join();
-        }
+        } 
+        // Barriera implicita: tutti i thread hanno terminato.
     }
-    
-    // Accumulate results and timings from all threads accedendo tramite .data
+
+    // -------------------------
+    // Aggregazione Sequenziale
+    // -------------------------
+    // Il master thread somma i risultati parziali senza alcun rischio di data race
     for (std::uint32_t id = 0; id < num_threads; ++id) {
         total.join_count += thread_results[id].data.join_count;
         total.checksum1  += thread_results[id].data.checksum1;
         total.checksum2  += thread_results[id].data.checksum2;
         
-        // Take the max time among threads to represent the critical path / bottleneck
         T.build = std::max(T.build, thread_timings[id].data.build);
         T.probe = std::max(T.probe, thread_timings[id].data.probe);
     }
@@ -668,11 +781,269 @@ static JoinResult naive_join_verifier(const std::vector<Record>& R,
     return result;
 }
 
+
+// ------------------------------------------------------------
+// Full sequential partitioned hash join (for correctness checking)
+// ------------------------------------------------------------
+// Histogram
+// ------------------------------------------------------------
+//
+// Count how many records go to each partition.
+//
+// hist[pid] = number of records whose key maps to pid
+//
+static std::vector<std::size_t> compute_histogram(const std::vector<Record>& rel, std::uint32_t p) {
+    std::vector<std::size_t> hist(p, 0);
+
+    for (const auto& rec : rel) {
+        const std::uint32_t pid = compute_partition_id(rec.key, p);
+        ++hist[pid];
+    }
+    
+    return hist;
+}
+
+// ------------------------------------------------------------
+// Prefix sum (exclusive scan)
+// ------------------------------------------------------------
+//
+// Given a histogram, compute the begin offsets of each partition.
+//
+// Example:
+//   hist  = [0, 1, 2, 5]
+//   begin = [0, 0, 1, 3]
+//
+// Then partition p occupies [begin[p], begin[p] + hist[p]).
+//
+static std::vector<std::size_t> exclusive_prefix_sum(const std::vector<std::size_t>& hist) {
+    std::vector<std::size_t> begin(hist.size(), 0);
+
+    std::size_t running = 0;
+    for (std::size_t p = 0; p < hist.size(); ++p) {
+        begin[p] = running;
+        running += hist[p];
+    }
+    return begin;
+}
+
+// ------------------------------------------------------------
+// Scatter into a partitioned array
+// ------------------------------------------------------------
+//
+// Reorder records so that all records belonging to the same partition become
+// contiguous in memory.
+//
+// We use a write cursor per partition, initialized from the begin offsets.
+//
+static std::vector<Record> scatter_partitioned(const std::vector<Record>& rel,
+                                               std::uint32_t p,
+                                               const std::vector<std::size_t>& begin) {
+    std::vector<Record> out(rel.size());
+
+    // Current write position for each partition.
+    std::vector<std::size_t> next = begin;
+
+    for (const auto& rec : rel) {
+        const std::uint32_t pid = compute_partition_id(rec.key, p);
+        out[next[pid]++] = rec;
+    }
+
+    return out;
+}
+
+
+// ------------------------------------------------------------
+// Full partitioning pipeline for one relation
+// ------------------------------------------------------------
+//
+// This groups together the steps:
+//   histogram -> prefix sum -> scatter -> end offsets
+//
+// After this phase, all records belonging to the same partition
+// are stored contiguously in memory, enabling independent processing.
+//
+static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, PhaseTiming::PartitionPhase& T_part) {
+    std::vector<std::size_t> hist;
+    std::vector<std::size_t> begin;
+    std::vector<Record> data;
+    std::vector<std::size_t> end(p);
+
+    {
+        ScopedTimer t(T_part.histogram);
+        hist = compute_histogram(rel, p);
+    }
+
+    {
+        ScopedTimer t(T_part.prefix);
+        begin = exclusive_prefix_sum(hist);
+    }
+
+    {
+        ScopedTimer t(T_part.scatter);
+        data = scatter_partitioned(rel, p, begin);
+    }
+
+    {
+        ScopedTimer t(T_part.end);
+        for (std::uint32_t i = 0; i < p; i++) {
+            end[i] = begin[i] + hist[i];
+        }
+    }
+
+    return PartitionedRelation{
+        .data = std::move(data),
+        .begin = begin,
+        .end = end
+    };
+}
+
+
+
+// ------------------------------------------------------------
+// Local join on one partition
+// ------------------------------------------------------------
+//
+// We process one partition p as follows:
+//
+//   Build:
+//     Scan R_p and compute countR[key]
+//
+//   Probe:
+//     Scan S_p
+//     If key k is present in countR, then each occurrence in S_p matches
+//     countR[k] occurrences in R_p.
+//
+// Duplicates are handled by counting occurrences in R.
+// Each record in S contributes as many matches as the multiplicity
+// of its key in the corresponding partition of R.
+//
+static JoinResult join_one_partition(const PartitionedRelation& Rpart,
+                                     const PartitionedRelation& Spart,
+                                     std::uint32_t pid,
+                                     PhaseTiming& T) {
+    JoinResult result{};
+
+    const std::size_t r_begin = Rpart.begin[pid];
+    const std::size_t r_end = Rpart.end[pid];
+    const std::size_t s_begin = Spart.begin[pid];
+    const std::size_t s_end = Spart.end[pid];
+
+    // Nothing to do if either partition is empty.
+    if (r_begin == r_end || s_begin == s_end) {
+        return result;
+    }
+
+    // Build phase:
+    // count how many times each key appears in R_p.
+	//
+    ska::flat_hash_map<std::uint64_t, std::uint32_t> countR;
+    countR.reserve((r_end - r_begin) * 2);
+
+    {
+        ScopedTimer t(T.build);
+        for (std::size_t i = r_begin; i < r_end; ++i) {
+            ++countR[Rpart.data[i].key];
+        }
+    }
+
+
+    // Probe phase:
+    // for each key in S_p, if it exists in countR, add countR[key] matches.
+    {
+        ScopedTimer t(T.probe);
+        for (std::size_t i = s_begin; i < s_end; ++i) {
+            const std::uint64_t key = Spart.data[i].key;
+            const auto it = countR.find(key);
+            if (it != countR.end()) {
+                const std::uint64_t multiplicity = it->second;
+
+                result.join_count += multiplicity;
+                result.checksum1 += splitmix64(key) * multiplicity;
+                result.checksum2 += splitmix64(key ^ 0x9e3779b97f4a7c15ULL) * multiplicity;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ------------------------------------------------------------
+// Full sequential partitioned hash join
+// ------------------------------------------------------------
+//
+// This is the end-to-end baseline:
+//
+//   1. Partition R
+//   2. Partition S
+//   3. For each partition p:
+//        local build + local probe
+//   4. Accumulate results
+//
+// Each partition can be processed independently.
+// This property is the basis for parallelization in Module 2.
+//
+static JoinResult partitioned_hash_join_sequential(
+    const std::vector<Record>& R,
+    const std::vector<Record>& S,
+    std::uint32_t p,
+    PhaseTiming& T)
+{
+    JoinResult total{};
+
+    // -------------------------
+    // Phase 1: partitioning R
+    // -------------------------
+    PartitionedRelation Rpart;
+    {
+        ScopedTimer t(T.R.total);
+        Rpart = partition_relation(R, p, T.R);
+    }
+
+    // -------------------------
+    // Phase 2: partitioning S
+    // -------------------------
+    PartitionedRelation Spart;
+    {
+        ScopedTimer t(T.S.total);
+        Spart = partition_relation(S, p, T.S);
+    }
+
+    // -------------------------
+    // Phase 3: join phase
+    // -------------------------
+    {
+        ScopedTimer t(T.join_loop);
+
+        for (std::uint32_t pid = 0; pid < p; ++pid) {
+            JoinResult local = join_one_partition(Rpart, Spart, pid, T);
+
+            total.join_count += local.join_count;
+            total.checksum1  += local.checksum1;
+            total.checksum2  += local.checksum2;
+        }
+    }
+
+    return total;
+}
+
+
+
+
+OmpSchedule parse_schedule(const std::string& s)
+{
+    if (s == "static")  return OmpSchedule::STATIC;
+    if (s == "dynamic") return OmpSchedule::DYNAMIC;
+    if (s == "guided")  return OmpSchedule::GUIDED;
+    return OmpSchedule::AUTO;
+}
+
 // ------------------------------------------------------------
 // Main
 // ------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, chunk_size = 1;
+    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, chunk_size = 1,subset_size = 0;
+    double sigma = 0.0, crest_shape = 1.0;
+    std::string sched = "";
     int nthreads = std::thread::hardware_concurrency();
     if (nthreads == 0) nthreads = 1;
 
@@ -681,7 +1052,12 @@ int main(int argc, char** argv) {
         !read_arg_u64(argc, argv, "-ns", ns) ||
         !read_arg_u64(argc, argv, "-seed", seed) ||
         !read_arg_u64(argc, argv, "-max-key", max_key) ||
-        !read_arg_u64(argc, argv, "-p", p)) {
+        !read_arg_u64(argc, argv, "-p", p)||
+        !read_arg_double(argc, argv, "-sigma", sigma) ||
+        !read_arg_u64(argc, argv, "-subset-size", subset_size) ||
+        !read_arg_double(argc, argv, "-crest-shape", crest_shape) ||
+        !read_arg_string(argc, argv, "-sched", sched)
+    ) {
         usage(argv[0]);
         return 1;
     }
@@ -699,6 +1075,7 @@ int main(int argc, char** argv) {
 
     const std::uint32_t P = static_cast<std::uint32_t>(p);
 
+    OmpSchedule omp_sched = parse_schedule(sched);
 
     // The power-of-two constraint on P is only due to the default
 	// mapping used here. It may be removed if the chosen partition
@@ -713,8 +1090,8 @@ int main(int argc, char** argv) {
 
     // Deterministic generation.
     // We use two different seeds so that R and S are not identical.
-    const auto R = generate_relation(NR, seed, max_key);
-    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key);
+    const auto R = generate_relation(NR, seed, max_key, P, sigma, subset_size, crest_shape);
+    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key, P, sigma, subset_size, crest_shape);
 
     const int RUNS = 10;
 
@@ -723,11 +1100,15 @@ int main(int argc, char** argv) {
     times.reserve(RUNS);
     results.reserve(RUNS);
 
+    // Set the OpenMP schedule for the join loop. This will affect how partitions are distributed among threads.
+    set_schedule(omp_sched, chunk_size);
+
+
     for (int i = 0; i < RUNS + 2; i++) {
         PhaseTiming T;
 
         const auto t0 = std::chrono::steady_clock::now();
-        JoinResult r = partitioned_hash_join_sequential(R, S, P, nthreads, chunk_size, T);
+        JoinResult r = partitioned_hash_join(R, S, P, nthreads, T);
         const auto t1 = std::chrono::steady_clock::now();
 
         T.total = std::chrono::duration<double>(t1 - t0).count();
@@ -764,6 +1145,19 @@ int main(int argc, char** argv) {
     std::cout << std::fixed << std::setprecision(6);
 
     if (NR <= 500 && NS <= 500) {
+        const JoinResult naive = naive_join_verifier(R, S);
+        std::cout << "naive_join_count=" << naive.join_count << "\n";
+        std::cout << "naive_checksum1=" << naive.checksum1 << "\n";
+        std::cout << "naive_checksum2=" << naive.checksum2 << "\n";
+    }
+
+    std::cout << "\n========== Sequential version (check for correcteness) ==========\n";
+    PhaseTiming T;
+    JoinResult r = partitioned_hash_join_sequential(R, S, P, T);
+    std::cout << "join_count=" << r.join_count << "\n";
+    std::cout << "checksum1=" << r.checksum1 << "\n";
+    std::cout << "checksum2=" << r.checksum2 << "\n";
+    if(NR <= 500 && NS <= 500) {
         const JoinResult naive = naive_join_verifier(R, S);
         std::cout << "naive_join_count=" << naive.join_count << "\n";
         std::cout << "naive_checksum1=" << naive.checksum1 << "\n";

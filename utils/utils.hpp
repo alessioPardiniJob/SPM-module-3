@@ -17,6 +17,7 @@ struct PhaseTiming {
         double prefix = 0.0;
         double scatter = 0.0;
         double end = 0.0; 
+        double teardown = 0.0; 
         double total = 0.0;
     };
 
@@ -26,6 +27,7 @@ struct PhaseTiming {
     double build = 0.0;
     double probe = 0.0;
     double join_loop = 0.0;
+    double teardown = 0.0;
     double total = 0.0;
 };
 

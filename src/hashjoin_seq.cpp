@@ -1,3 +1,23 @@
+// hashjoin_seq.cpp
+//
+// Sequential reference for Module 2
+// Partitioned Hash Join with Duplicates
+//
+// This code is intentionally written to be simple and readable.
+// It is meant as a reference baseline and as a starting point for
+// the parallel version. You can modify it for improving performance,
+// provided you do not change the overall algorithm.
+// 
+//
+// IMPORTANT:
+// The function compute_partition_id(...) below is intentionally very simple.
+// Students must replace it with their own mapping function from Module 1.
+// The same mapping function must be used consistently in both the sequential
+// and parallel versions.
+//
+// Run example:
+//   ./hashjoin_seq -nr 5 -ns 8 -seed 13 -max-key 8 -p 4
+//
 // Output:
 //   join_count
 //   checksum1
@@ -63,8 +83,9 @@
 #include <algorithm>
 #include <cmath>
 #include "utils/utils.hpp"
-#include <thread>
-#include <atomic>
+#include <numeric> 
+#include <iomanip> 
+#include <fstream> 
 // ------------------------------------------------------------
 // Record definition
 // ------------------------------------------------------------
@@ -88,16 +109,32 @@ static bool read_arg_u64(int argc, char** argv, const std::string& name, std::ui
     }
     return false;
 }
+
+
+static bool read_arg_double(int argc, char** argv, const std::string& name, double& out) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (name == argv[i]) {
+            out = std::stod(argv[i + 1]);
+            return true;
+        }
+    }
+    return false;
+}
+
+
+
 static void usage(const char* prog) {
     std::cerr
         << "Usage:\n"
         << "  " << prog << " -nr NR -ns NS -seed SEED -max-key K -p P\n\n"
         << "Parameters:\n"
-        << "  -nr         Number of records in relation R\n"
-        << "  -ns         Number of records in relation S\n"
-        << "  -seed       Deterministic seed\n"
-        << "  -max-key    Keys are generated in [0, max-key)\n"
-        << "  -p          Number of partitions (power of two required in this reference code)\n";
+        << "  -nr          Number of records in relation R\n"
+        << "  -ns          Number of records in relation S\n"
+        << "  -seed        Deterministic seed\n"
+        << "  -max-key     Keys are generated in [0, max-key)\n"
+        << "  -p           Number of partitions (power of two required in this reference code)\n"
+        << "  -sigma       Skew factor (0.0 = totalmente uniforme)\n"
+        << "  -subset-size Target subset size for skewed data\n";
 }
 static bool is_power_of_two(std::uint32_t x) {
     return x != 0 && (x & (x - 1U)) == 0;
@@ -128,13 +165,128 @@ static inline std::uint64_t splitmix64_next(std::uint64_t& state) {
 }
 
 
-static std::vector<Record> generate_relation(std::size_t n, std::uint64_t seed, std::uint64_t max_key) {
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <random>
+
+
+static std::vector<Record> generate_relation(
+    std::size_t n, 
+    std::uint64_t seed, 
+    std::uint64_t max_key,
+    std::uint32_t num_partitions,        // P nel LaTeX
+    double skew_factor = 0.0,            // sigma (0.0 = totalmente uniforme)
+    std::uint32_t target_subset_size = 0,// M (dimensione del subset di partizioni hot)
+    double crest_shape = 1.0             // theta (1.0 = plateau uniforme, >1.0 = cresta appuntita verso l'indice 0)
+) {
     std::vector<Record> out(n);
     std::uint64_t state = seed;
 
+    // =================================================================
+    // SETUP: Creazione del subset "sparso" di partizioni
+    // =================================================================
+    std::vector<std::uint32_t> hot_partitions;
+    if (target_subset_size > 0 && skew_factor > 0.0) {
+        std::uint32_t actual_subset_size = std::min(target_subset_size, num_partitions);
+        hot_partitions.resize(actual_subset_size);
+
+        std::vector<std::uint32_t> all_parts(num_partitions);
+        std::iota(all_parts.begin(), all_parts.end(), 0);
+
+        // Mischiamo con un seed derivato per garantire la riproducibilità
+        std::mt19937_64 rng(seed + 0xDEADBEEF); 
+        std::shuffle(all_parts.begin(), all_parts.end(), rng);
+
+        for(std::uint32_t i = 0; i < actual_subset_size; ++i) {
+            hot_partitions[i] = all_parts[i];
+        }
+    }
+
     for (std::size_t i = 0; i < n; ++i) {
-        const std::uint64_t r = splitmix64_next(state);
-        out[i].key = (max_key == 0) ? 0ULL : (r % max_key);
+        if (max_key == 0) {
+            out[i].key = 0ULL;
+            continue;
+        }
+
+        // Estraiamo un valore uniforme u ~ U(0,1) per decidere la natura del record
+        std::uint64_t r_skew = splitmix64_next(state);
+        double u = static_cast<double>(r_skew) / static_cast<double>(-1ULL);
+
+        if (u < skew_factor && target_subset_size > 0) {
+            // =================================================================
+            // SKEWED PATH (Sintesi Deterministica)
+            // =================================================================
+            
+            // 1. Estraiamo un valore uniforme tra 0.0 e 1.0 per la scelta della partizione
+            std::uint64_t r_part = splitmix64_next(state);
+            double u_idx = static_cast<double>(r_part) / static_cast<double>(-1ULL);
+
+            // 2. Applichiamo la distorsione (Power-law) per creare la cresta
+            double skewed_u = std::pow(u_idx, crest_shape);
+
+            // 3. Calcoliamo l'indice schiacciato verso lo zero
+            std::uint32_t idx = static_cast<std::uint32_t>(skewed_u * hot_partitions.size());
+
+            // Controllo di sicurezza per evitare out-of-bounds (dovuti ad arrotondamenti float estremi)
+            if (idx >= hot_partitions.size()) {
+                idx = hot_partitions.size() - 1;
+            }
+            
+            // Estraiamo il vero ID della partizione (promosso a uint32_t)
+            std::uint32_t p_target = hot_partitions[idx];
+
+            if (max_key < (1ULL << 32)) {
+                // -------------------------------------------------------------
+                // CASE A: K_max < 2^32 (No XOR Cancellation)
+                // -------------------------------------------------------------
+                std::uint64_t max_multiples = max_key / num_partitions;
+
+                if (max_multiples == 0) {
+                    // Caso limite: K_max è più piccolo del numero di partizioni
+                    out[i].key = p_target % max_key;
+                } else {
+                    // R % max_multiples genera un valore in [0, (K_max/P) - 1]
+                    // equivalente a U(0, floor(K_max/P) - 1) ed evita underflow negativi
+                    std::uint64_t r_mult = splitmix64_next(state);
+                    std::uint64_t R = r_mult % max_multiples; 
+                    
+                    out[i].key = (R * num_partitions) + p_target;
+                }
+            } 
+            else {
+                // -------------------------------------------------------------
+                // CASE B: K_max >= 2^32 (Hierarchical Bounding & Cancellation)
+                // -------------------------------------------------------------
+                
+                // 1. Upper Half Generation (Assorbe il vincolo max_key)
+                std::uint64_t k_high_bound = max_key >> 32;
+                std::uint64_t r_high = splitmix64_next(state);
+                std::uint64_t k_high = r_high % k_high_bound; // Strettamente < K_max >> 32
+
+                // 2. Noise Extraction (O_high = k_high mod P)
+                std::uint64_t o_high = k_high % num_partitions;
+
+                // 3. Padding Generation (R ristretto rigorosamente nello spazio a 32 bit)
+                std::uint64_t max_multiples_32 = (1ULL << 32) / num_partitions;
+                std::uint64_t r_mult = splitmix64_next(state);
+                std::uint64_t R = r_mult % max_multiples_32; // Garantisce che k_low non sborderà mai nei 32 bit alti
+
+                // 4. Pre-emptive Cancellation (Anti-venom) & Low 32-bit Synthesis
+                std::uint64_t B = p_target ^ o_high;
+                std::uint64_t k_low = (R * num_partitions) + B;
+
+                // 5. 64-bit Assembly
+                out[i].key = (k_high << 32) | k_low;
+            }
+        } 
+        else {
+            // =================================================================
+            // UNIFORM PATH (Fallback logica originale)
+            // =================================================================
+            const std::uint64_t r = splitmix64_next(state);
+            out[i].key = r % max_key;
+        }
     }
     return out;
 }
@@ -144,13 +296,6 @@ static std::vector<Record> generate_relation(std::size_t n, std::uint64_t seed, 
 // Intentionally simple partition mapping
 // ------------------------------------------------------------
 //
-// This mapping is deliberately minimal.
-// It is here only so that the reference code is complete and runnable.
-//
-// Students must replace this function with their own implementation from Module 1.
-// The same mapping function must be used consistently in both the sequential
-// and parallel versions to ensure a fair performance comparison.
-//
 // If P is a power of two, then key & (P-1) maps into [0, P).
 // This is fast, but intentionally simplistic.
 //
@@ -159,6 +304,7 @@ static inline std::uint16_t compute_partition_id(std::uint64_t key, std::uint32_
     std::uint64_t mixed = key ^ (key >> 32);
     return static_cast<std::uint16_t>(mixed & mask);
 }
+
 // ------------------------------------------------------------
 // Histogram
 // ------------------------------------------------------------
@@ -167,98 +313,16 @@ static inline std::uint16_t compute_partition_id(std::uint64_t key, std::uint32_
 //
 // hist[pid] = number of records whose key maps to pid
 //
-static std::vector<std::size_t> compute_histogram_privatized(const std::vector<Record>& rel, std::uint32_t p, std::uint32_t num_threads) {
-    std::vector<std::size_t> final_hist(p, 0);
-    
-    // local histograms: each thread has its own private histogram to avoid contention
-    std::vector<std::vector<std::size_t>> local_hists(num_threads, std::vector<std::size_t>(p, 0));
+static std::vector<std::size_t> compute_histogram(const std::vector<Record>& rel, std::uint32_t p) {
+    std::vector<std::size_t> hist(p, 0);
 
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    // Block-based distribution strategy
-    auto block_based = [&](int threadid) {
-        // Compute the range of records this thread will process
-        std::size_t total_records = rel.size();
-        std::size_t parts_per_thread = total_records / num_threads;
-        std::size_t rem = total_records % num_threads;
-        // Each thread processes a contiguous block of records, with the first 'rem' threads processing one extra record to handle any remainder.
-        std::size_t lower = threadid * parts_per_thread + std::min(static_cast<std::size_t>(threadid), rem);
-        std::size_t upper = lower + parts_per_thread + (threadid < static_cast<int>(rem) ? 1 : 0);
-
-        // Compute local histogram for the assigned block of records
-        auto& my_hist = local_hists[threadid];
-
-        for (std::size_t i = lower; i < upper; ++i) {
-            std::uint32_t pid = compute_partition_id(rel[i].key, p);
-            
-            // Increment local histogram count for this partition
-            my_hist[pid]++; 
-        }
-    };
-
-    // Spawn threads
-    for (std::uint32_t id = 0; id < num_threads; ++id) {
-        threads.emplace_back([&, threadid = id]() {
-            block_based(threadid);
-        });
+    for (const auto& rec : rel) {
+        const std::uint32_t pid = compute_partition_id(rec.key, p);
+        ++hist[pid];
     }
-
-    // Wait for all threads to finish
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    // Aggregate local histograms into the final histogram
-    for (std::uint32_t t = 0; t < num_threads; ++t) {
-        for (std::uint32_t i = 0; i < p; ++i) {
-            final_hist[i] += local_hists[t][i];
-        }
-    }
-
-    // Return the final histogram
-    return final_hist;
+    return hist;
 }
 
-/*
-static std::vector<std::vector<std::size_t>> compute_histogram_matrix(
-    const std::vector<Record>& rel, std::uint32_t p, std::uint32_t num_threads) 
-{
-    // Histogram 2D: a matrix of size [num_threads][p], where local_hists[t][pid] counts how many records 
-    std::vector<std::vector<std::size_t>> local_hists(num_threads, std::vector<std::size_t>(p, 0));
-
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    // Block-cyclic distribution strategy
-    auto block_based = [&](int threadid) {
-        // Compute the range of records this thread will process in a block-cyclic manner
-        std::size_t total_records = rel.size();
-        std::size_t parts_per_thread = total_records / num_threads;
-        std::size_t rem = total_records % num_threads;
-        
-        // Each thread processes either parts_per_thread or parts_per_thread + 1 records, depending on the remainder
-        std::size_t lower = threadid * parts_per_thread + std::min(static_cast<std::size_t>(threadid), rem);
-        std::size_t upper = lower + parts_per_thread + (threadid < static_cast<int>(rem) ? 1 : 0);
-
-        // Compute local histogram for the assigned block of records
-        auto& my_hist = local_hists[threadid];
-        for (std::size_t i = lower; i < upper; ++i) {
-            std::uint32_t pid = compute_partition_id(rel[i].key, p);
-            my_hist[pid]++; 
-        }
-    };
-
-    // Launch threads to compute local histograms in parallel
-    for (std::uint32_t id = 0; id < num_threads; ++id) {
-        threads.emplace_back([&, threadid = id]() { block_based(threadid); });
-    }
-    // Wait for all threads to finish
-    for (auto& t : threads) { t.join(); }
-
-    // Return the 2D histogram matrix
-    return local_hists;
-}*/
 
 // ------------------------------------------------------------
 // Prefix sum (exclusive scan)
@@ -335,7 +399,7 @@ struct PartitionedRelation {
 // After this phase, all records belonging to the same partition
 // are stored contiguously in memory, enabling independent processing.
 //
-static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, std::uint32_t num_threads, PhaseTiming::PartitionPhase& T_part) {
+static PartitionedRelation partition_relation(const std::vector<Record>& rel, std::uint32_t p, PhaseTiming::PartitionPhase& T_part) {
     std::vector<std::size_t> hist;
     std::vector<std::size_t> begin;
     std::vector<Record> data;
@@ -343,7 +407,7 @@ static PartitionedRelation partition_relation(const std::vector<Record>& rel, st
 
     {
         ScopedTimer t(T_part.histogram);
-        hist = compute_histogram_privatized(rel, p, num_threads);
+        hist = compute_histogram(rel, p);
     }
 
     {
@@ -397,11 +461,10 @@ struct JoinResult {
 // Each record in S contributes as many matches as the multiplicity
 // of its key in the corresponding partition of R.
 //
-static JoinResult join_one_partition_optimized(const PartitionedRelation& Rpart,
+static JoinResult join_one_partition(const PartitionedRelation& Rpart,
                                      const PartitionedRelation& Spart,
                                      std::uint32_t pid,
-                                     PhaseTiming& T,
-                                    ska::flat_hash_map<std::uint64_t, std::uint32_t>& countR) {
+                                     PhaseTiming& T) {
     JoinResult result{};
 
     const std::size_t r_begin = Rpart.begin[pid];
@@ -414,8 +477,10 @@ static JoinResult join_one_partition_optimized(const PartitionedRelation& Rpart,
         return result;
     }
 
-
-    countR.clear();
+    // Build phase:
+    // count how many times each key appears in R_p.
+	//
+    ska::flat_hash_map<std::uint64_t, std::uint32_t> countR;
     countR.reserve((r_end - r_begin) * 2);
 
     {
@@ -461,22 +526,10 @@ static JoinResult join_one_partition_optimized(const PartitionedRelation& Rpart,
 // Each partition can be processed independently.
 // This property is the basis for parallelization in Module 2.
 //
-
-// Strutture allineate per forzare ogni elemento su una Cache Line indipendente (64 bytes)
-struct alignas(64) AlignedJoinResult {
-    JoinResult data;
-};
-
-struct alignas(64) AlignedPhaseTiming {
-    PhaseTiming data;
-};
-
 static JoinResult partitioned_hash_join_sequential(
     const std::vector<Record>& R,
     const std::vector<Record>& S,
     std::uint32_t p,
-    std::uint32_t num_threads,
-    std::uint32_t chunk_size,
     PhaseTiming& T)
 {
     JoinResult total{};
@@ -487,7 +540,7 @@ static JoinResult partitioned_hash_join_sequential(
     PartitionedRelation Rpart;
     {
         ScopedTimer t(T.R.total);
-        Rpart = partition_relation(R, p, num_threads, T.R);
+        Rpart = partition_relation(R, p, T.R);
     }
 
     // -------------------------
@@ -496,75 +549,22 @@ static JoinResult partitioned_hash_join_sequential(
     PartitionedRelation Spart;
     {
         ScopedTimer t(T.S.total);
-        Spart = partition_relation(S, p, num_threads, T.S);
+        Spart = partition_relation(S, p, T.S);
     }
 
-// -------------------------
+    // -------------------------
     // Phase 3: join phase
-    // ------------------------
-    std::vector<AlignedJoinResult> thread_results(num_threads);
-    std::vector<AlignedPhaseTiming> thread_timings(num_threads);
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
+    // -------------------------
     {
-        ScopedTimer t(T.join_loop); 
+        ScopedTimer t(T.join_loop);
 
-        // Block-cyclic distribution strategy
-        auto block_cyclic = [&](int threadid) {
-            std::uint32_t offset = threadid * chunk_size;
-            std::uint32_t stride = num_threads * chunk_size;
+        for (std::uint32_t pid = 0; pid < p; ++pid) {
+            JoinResult local = join_one_partition(Rpart, Spart, pid, T);
 
-            // local accumulators for this thread
-            JoinResult local_total{};
-            PhaseTiming local_timing{}; 
-
-
-            ska::flat_hash_map<std::uint64_t, std::uint32_t> thread_map;
-            // Reserve space in the hash map to avoid dynamic resizing during the join phase, which can be costly.
-            thread_map.reserve((R.size() / p) * 2);
-
-            for (std::uint32_t lower = offset; lower < p; lower += stride) {
-                std::uint32_t upper = std::min(lower + chunk_size, p);
-                for (std::uint32_t pid = lower; pid < upper; ++pid) {
-                    // Process partition pid and accumulate results in local_total and local_timing
-                    JoinResult local = join_one_partition_optimized(Rpart, Spart, pid, local_timing, thread_map);
-                    
-                    // Accumulate results in local_total to minimize the number of writes to the shared thread_results array, which can cause contention.
-                    local_total.join_count += local.join_count;
-                    local_total.checksum1  += local.checksum1;
-                    local_total.checksum2  += local.checksum2;
-                }
-            }
-            
-            // Store results in the thread-specific array
-            // Writing the final results to the shared thread_results array only once per thread helps to reduce contention
-            thread_results[threadid].data = local_total;
-            thread_timings[threadid].data = local_timing;
-        };
-
-        // Spawn threads
-        for (std::uint32_t id = 0; id < num_threads; ++id) {
-            threads.emplace_back([&, threadid = id]() {
-                block_cyclic(threadid);
-            });
+            total.join_count += local.join_count;
+            total.checksum1  += local.checksum1;
+            total.checksum2  += local.checksum2;
         }
-
-        // Wait for all threads to finish
-        for (auto& thread : threads) {
-            thread.join();
-        }
-    }
-    
-    // Accumulate results and timings from all threads accedendo tramite .data
-    for (std::uint32_t id = 0; id < num_threads; ++id) {
-        total.join_count += thread_results[id].data.join_count;
-        total.checksum1  += thread_results[id].data.checksum1;
-        total.checksum2  += thread_results[id].data.checksum2;
-        
-        // Take the max time among threads to represent the critical path / bottleneck
-        T.build = std::max(T.build, thread_timings[id].data.build);
-        T.probe = std::max(T.probe, thread_timings[id].data.probe);
     }
 
     return total;
@@ -597,20 +597,20 @@ static JoinResult naive_join_verifier(const std::vector<Record>& R,
 // Main
 // ------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, chunk_size = 1;
-    int nthreads=std::thread::hardware_concurrency();
-
+    std::uint64_t nr = 0, ns = 0, seed = 0, max_key = 0, p = 0, subset_size = 0;
+    double sigma = 0.0,crest_shape = 1.0;
 
     if (!read_arg_u64(argc, argv, "-nr", nr) ||
         !read_arg_u64(argc, argv, "-ns", ns) ||
         !read_arg_u64(argc, argv, "-seed", seed) ||
         !read_arg_u64(argc, argv, "-max-key", max_key) ||
-        !read_arg_u64(argc, argv, "-p", p)) {
+        !read_arg_u64(argc, argv, "-p", p) ||
+        !read_arg_double(argc, argv, "-sigma", sigma) ||
+        !read_arg_u64(argc, argv, "-subset-size", subset_size) ||
+        !read_arg_double(argc, argv, "-crest-shape", crest_shape)) {
         usage(argv[0]);
         return 1;
     }
-
-    read_arg_u64(argc, argv, "-chunk", chunk_size);
 
     if (p > std::numeric_limits<std::uint32_t>::max()) {
         std::cerr << "Error: P too large.\n";
@@ -633,8 +633,11 @@ int main(int argc, char** argv) {
 
     // Deterministic generation.
     // We use two different seeds so that R and S are not identical.
-    const auto R = generate_relation(NR, seed, max_key);
-    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key);
+    const auto R = generate_relation(NR, seed, max_key, P, sigma, subset_size, crest_shape);
+    const auto S = generate_relation(NS, seed ^ 0xdeadebdecdeedef1ULL, max_key, P, sigma, subset_size, crest_shape);
+
+
+
 
     const int RUNS = 10;
 
@@ -647,7 +650,7 @@ int main(int argc, char** argv) {
         PhaseTiming T;
 
         const auto t0 = std::chrono::steady_clock::now();
-        JoinResult r = partitioned_hash_join_sequential(R, S, P, nthreads, chunk_size, T);
+        JoinResult r = partitioned_hash_join_sequential(R, S, P, T);
         const auto t1 = std::chrono::steady_clock::now();
 
         T.total = std::chrono::duration<double>(t1 - t0).count();
@@ -660,7 +663,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Nuova lambda per poter estrarre valori anche da sottostrutture (es. t.R.histogram)
+    // Utility to extract timing data for statistics printing.
     auto extract = [&](auto getter) {
         std::vector<double> v;
         v.reserve(times.size());
@@ -671,6 +674,24 @@ int main(int argc, char** argv) {
     };
 
     const JoinResult& result = results.back();
+
+    std::cout << "NR=" << NR << " NS=" << NS << " P=" << P
+              << " seed=" << seed
+              << " [0, " << max_key << ")\n";
+
+    std::cout << "join_count=" << result.join_count << "\n";
+    std::cout << "checksum1=" << result.checksum1 << "\n";
+    std::cout << "checksum2=" << result.checksum2 << "\n";
+
+    std::cout << std::fixed << std::setprecision(6);
+
+    if (NR <= 500 && NS <= 500) {
+        const JoinResult naive = naive_join_verifier(R, S);
+        std::cout << "naive_join_count=" << naive.join_count << "\n";
+        std::cout << "naive_checksum1=" << naive.checksum1 << "\n";
+        std::cout << "naive_checksum2=" << naive.checksum2 << "\n";
+    }
+
 
 
     std::cout << "NR=" << NR << " NS=" << NS << " P=" << P
@@ -689,6 +710,9 @@ int main(int argc, char** argv) {
         std::cout << "naive_checksum1=" << naive.checksum1 << "\n";
         std::cout << "naive_checksum2=" << naive.checksum2 << "\n";
     }
+
+
+
 
     std::cout << "\n========== BENCHMARK PROFILE ==========\n";
 

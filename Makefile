@@ -2,107 +2,79 @@ CXX        := g++
 CXXFLAGS   := -std=c++20 -Wall
 OPTFLAGS   := -O3 -fno-tree-vectorize
 INCLUDES := -I. -Ithird_party -Iutils
+OMPFLAGS   := -fopenmp
 
 SRC_DIR    := src
 BIN_DIR    := bin
 
-TARGET_UNORDERED 									:= $(BIN_DIR)/hashjoin_seq_unordered_map
-TARGET_FLAT      									:= $(BIN_DIR)/hashjoin_seq_flat_map
-TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKBASED      	:= $(BIN_DIR)/hashjoin_par_localjoin_static_blockBased
-TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC		:= $(BIN_DIR)/hashjoin_par_localjoin_static_blockCyclic
-TARGET_PARALLEL_LOCALJOIN_DYNAMIC_THREADPOOL		:= $(BIN_DIR)/hashjoin_par_localjoin_dynamic_threadPool
-
-
-TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC_OPTIMIZED := $(BIN_DIR)/hashjoin_par_localjoin_static_blockCyclic_Optimized
-
-
-
-TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_GLOBALATOMIC					:= $(BIN_DIR)/hashjoin_par_partitioning_compute_histogram_globalAtomic
-TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL							:= $(BIN_DIR)/hashjoin_par_partitioning_compute_histogram_local
-TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_FLATARRAY					:= $(BIN_DIR)/hashjoin_par_partitioning_compute_histogram_local_flatArrayPadding
-TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_THREADAFFINITY			:= $(BIN_DIR)/hashjoin_par_partitioning_compute_histogram_local_threadAffinity
-
-TARGET_PARALLEL_PARTITIONING_SCATTER_GLOBALATOMIC					:= $(BIN_DIR)/hashjoin_par_partitioning_scatter_Atomic
-TARGET_PARALLEL_PARTITIONING_SCATTER								:= $(BIN_DIR)/hashjoin_par_partitioning_scatter
-TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED						:= $(BIN_DIR)/hashjoin_par_partitioning_scatterBuffered
-TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED_FIRSTTOUCH			:= $(BIN_DIR)/hashjoin_par_partitioning_scatterBufferedFirstTouch
-
-TARGET_PARALLEL_FINAL := $(BIN_DIR)/hashjoin_par_final
+TARGET_SEQ      										:= $(BIN_DIR)/hashjoin_seq
+TARGET_PARALLEL_CPP 									:= $(BIN_DIR)/hashjoin_par_cpp
+TARGET_SKEWNESS_ANALYSIS 								:= $(BIN_DIR)/skewness_analysis
+TARGET_PARALLEL_OMP_LOOP_LEVEL 							:= $(BIN_DIR)/hashjoin_par_ompLoopLevel
+TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY 	:= $(BIN_DIR)/hashjoin_par_ompLoopLevel_AdaptiveMemory
+TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_1HM_X_PARTITIONS 	:= $(BIN_DIR)/hashjoin_par_ompLoopLevel_1HM_x_partitions
+TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY_TUNING_SCHEDULING := $(BIN_DIR)/hashjoin_par_ompLoopLevel_AdaptiveMemoryTuning
+TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_PARTITIONING		:= $(BIN_DIR)/hashjoin_par_ompTaskLevel_OvSubPartitioningPhase
+TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_LOCALJOIN		:= $(BIN_DIR)/hashjoin_par_ompTaskLevel_OvSubLocalJoin
 
 
 COMMON_FLAGS := $(CXXFLAGS) $(OPTFLAGS) $(INCLUDES)
 
-.PHONY: all clean directories unordered flat parallel_localjoin_static_blockbased	parallel_localjoin_static_blockcyclic parallel_localjoin_dynamic_threadpool parallel_localjoin_static_blockcyclic_optimized parallel_partitioning_compute_histogram_globalatomic parallel_partitioning_compute_histogram_local parallel_partitioning_compute_histogram_local_flatarray parallel_partitioning_compute_histogram_local_threadaffinity parallel_partitioning_scatter_globalatomic parallel_partitioning_scatter parallel_partitioning_scatter_buffered parallel_partitioning_scatter_buffered_firsttouch parallel_final
+.PHONY: all clean directories seq parallel_cpp parallel_omp_loop_level parallel_omp_loop_level_join_adaptive_memory parallel_omp_loop_level_join_1hm_x_partitions parallel_omp_task_level_oversubscription_partitioning skewness_analysis parallel_omp_task_level_oversubscription_localjoin parallel_omp_loop_level_join_adaptive_memory_tuning_scheduling
 
 # Default: build everything
-all: directories $(TARGET_UNORDERED) $(TARGET_FLAT) $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKBASED) $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC) $(TARGET_PARALLEL_LOCALJOIN_DYNAMIC_THREADPOOL) $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC_OPTIMIZED) $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_GLOBALATOMIC) $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL) $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_FLATARRAY) $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_THREADAFFINITY) $(TARGET_PARALLEL_PARTITIONING_SCATTER_GLOBALATOMIC) $(TARGET_PARALLEL_PARTITIONING_SCATTER) $(TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED) $(TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED_FIRSTTOUCH) $(TARGET_PARALLEL_FINAL)
+all: directories $(TARGET_SEQ) $(TARGET_PARALLEL_CPP) $(TARGET_PARALLEL_OMP_LOOP_LEVEL) $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY) $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_1HM_X_PARTITIONS) $(TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_PARTITIONING) $(TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_LOCALJOIN) $(TARGET_SKEWNESS_ANALYSIS) $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY_TUNING_SCHEDULING)
 
-unordered: directories $(TARGET_UNORDERED)
-flat: directories $(TARGET_FLAT)
-parallel_localjoin_static_blockbased: directories $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKBASED)
-parallel_localjoin_static_blockcyclic: directories $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC)
-parallel_localjoin_dynamic_threadpool: directories $(TARGET_PARALLEL_LOCALJOIN_DYNAMIC_THREADPOOL)
-parallel_localjoin_static_blockcyclic_optimized: directories $(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC_OPTIMIZED)
+seq : directories $(TARGET_SEQ)
 
-parallel_partitioning_compute_histogram_globalatomic: directories $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_GLOBALATOMIC)
-parallel_partitioning_compute_histogram_local: directories $(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL)
+skewness_analysis : directories $(TARGET_SKEWNESS_ANALYSIS)
 
-parallel_partitioning_scatter_globalatomic: directories $(TARGET_PARALLEL_PARTITIONING_SCATTER_GLOBALATOMIC)
-parallel_partitioning_scatter: directories $(TARGET_PARALLEL_PARTITIONING_SCATTER)
-parallel_partitioning_scatter_buffered: directories $(TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED)
+parallel_cpp : directories $(TARGET_PARALLEL_CPP)
 
+parallel_omp_loop_level : directories $(TARGET_PARALLEL_OMP_LOOP_LEVEL)
 
-parallel_final : directories $(TARGET_PARALLEL_FINAL)
+parallel_omp_loop_level_join_adaptive_memory : directories $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY)
+
+parallel_omp_loop_level_join_1hm_x_partitions : directories $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_1HM_X_PARTITIONS)
+
+parallel_omp_loop_level_join_adaptive_memory_tuning_scheduling : directories $(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY_TUNING_SCHEDULING)
+
+parallel_omp_task_level_oversubscription_localjoin : directories $(TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_LOCALJOIN)
+
 # -------- Directories --------
 directories:
 	mkdir -p $(BIN_DIR)
 
 # -------- Targets --------
 
-$(TARGET_UNORDERED): $(SRC_DIR)/hashjoin_seq_unordered_map.cpp
+$(TARGET_SEQ): $(SRC_DIR)/hashjoin_seq.cpp
 	$(CXX) $(COMMON_FLAGS) -o $@ $<
 
-$(TARGET_FLAT): $(SRC_DIR)/hashjoin_seq_flat_map.cpp
+$(TARGET_SKEWNESS_ANALYSIS): $(SRC_DIR)/hashjoin_skewnessAnalysis.cpp
+	$(CXX) $(COMMON_FLAGS) -o $@ $<	
+
+$(TARGET_PARALLEL_CPP): $(SRC_DIR)/hashjoin_par_cpp.cpp
 	$(CXX) $(COMMON_FLAGS) -o $@ $<
 
-$(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKBASED): $(SRC_DIR)/Parallelization/localJoin/hashjoin_par_localjoin_static_blockBased.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
+$(TARGET_PARALLEL_OMP_LOOP_LEVEL): $(SRC_DIR)/omp_loop_level/memoryManagment/hashjoin_par_ompLoopLevel.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
 
-$(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC): $(SRC_DIR)/Parallelization/localJoin/hashjoin_par_localjoin_static_blockCyclic.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_LOCALJOIN_DYNAMIC_THREADPOOL): $(SRC_DIR)/Parallelization/localJoin/hashjoin_par_localjoin_dynamic_threadPool.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_LOCALJOIN_STATIC_BLOCKCYCLIC_OPTIMIZED): $(SRC_DIR)/Parallelization/localJoin/hashjoin_par_localjoin_static_blockCyclic_Optimized.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_GLOBALATOMIC): $(SRC_DIR)/Parallelization/partitioning/compute_histogram/hashjoin_par_partitioning_compute_histogram_globalAtomic.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL): $(SRC_DIR)/Parallelization/partitioning/compute_histogram/hashjoin_par_partitioning_compute_histogram_local.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_FLATARRAY): $(SRC_DIR)/Parallelization/partitioning/compute_histogram/hashjoin_par_partitioning_compute_histogram_local_flatArrayPadding.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-
-$(TARGET_PARALLEL_PARTITIONING_COMPUTEHISTOGRAM_LOCAL_THREADAFFINITY): $(SRC_DIR)/Parallelization/partitioning/compute_histogram/hashjoin_par_partitioning_compute_histogram_local_threadAffinity.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
+$(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY): $(SRC_DIR)/omp_loop_level/memoryManagment/hashjoin_par_ompLoopLevel_AdaptiveMemory.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
 
 
-$(TARGET_PARALLEL_PARTITIONING_SCATTER_GLOBALATOMIC): $(SRC_DIR)/Parallelization/partitioning/scatter/hashjoin_par_partitioning_scatter_Atomic.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
+$(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_1HM_X_PARTITIONS): $(SRC_DIR)/omp_loop_level/memoryManagment/hashjoin_par_ompLoopLevel_1HM_x_partitions.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
+
+$(TARGET_PARALLEL_OMP_LOOP_LEVEL_JOIN_ADAPTIVE_MEMORY_TUNING_SCHEDULING): $(SRC_DIR)/omp_loop_level/tuningScheduling/hashjoin_par_ompLoopLevel_AdaptiveMemoryTuning.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
 
 
-$(TARGET_PARALLEL_PARTITIONING_SCATTER): $(SRC_DIR)/Parallelization/partitioning/scatter/hashjoin_par_partitioning_scatter.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
-$(TARGET_PARALLEL_PARTITIONING_SCATTER_BUFFERED): $(SRC_DIR)/Parallelization/partitioning/scatter/hashjoin_par_partitioning_scatterBuffered.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
+$(TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_PARTITIONING): $(SRC_DIR)/omp_task_level/hashjoin_par_ompTaskLevel_OvSubPartitioningPhase.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
 
-
-
-$(TARGET_PARALLEL_FINAL): $(SRC_DIR)/hashjoin_par_final.cpp
-	$(CXX) $(COMMON_FLAGS) -o $@ $<
+$(TARGET_PARALLEL_OMP_TASK_LEVEL_OVERSUBSCRIPTION_LOCALJOIN): $(SRC_DIR)/omp_task_level/hashjoin_par_ompTaskLevel_OvSubLocalJoin.cpp
+	$(CXX) $(COMMON_FLAGS) $(OMPFLAGS) -o $@ $<
 
 # Clean
 clean:
