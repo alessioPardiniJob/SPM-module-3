@@ -73,20 +73,21 @@ make parallel_omp_loop_level_join_adaptive_memory_tuning_scheduling
 ## EXPERIMENT 1.1 - Memory Managment
 This experiment evaluates different memory management strategies in the local join kernel under both uniform and skewed workload distributions. The goal is to assess how allocation policy and hash table reuse impact performance, particularly during the build and probe phases of the join operation.
 ### HOW TO EXECUTE
+Hoisted (1 map/thread)
 ```bash 
 srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
 ```bash 
 srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
-
+1 map/partition
 ```bash 
 srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_1HM_x_partitions -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
 ```bash 
 srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_1HM_x_partitions -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
-
+Adaptive Memory
 ```bash 
 srun -w node07 --exclusive --time=00:01:00 ./bin/hashjoin_par_ompLoopLevel_AdaptiveMemory -nr 20000000 -ns 20000000 -seed 42 -max-key 10000000 -p 256 -sigma 0.95 -subset-size 10 -crest-shape 2 -sched "dynamic" -chunk 8
 ```
