@@ -17,7 +17,7 @@ BEST_CHUNK=1
 THREADS_LIST=(1 4 8 16 32 64)
 
 # ==============================================================================
-# Dataset Configurations (Morphology fixed, don't scale these!)
+# Dataset Configurations 
 # ==============================================================================
 declare -A DATASETS
 DATASETS["uniform"]="-sigma 0 -subset-size 10 -crest-shape 2"
@@ -60,7 +60,7 @@ for dataset_name in "uniform" "skewed"; do
     echo -e "${CYAN}--- DATASET: ${dataset_name^^} ---${NC}"
 
     for T in "${THREADS_LIST[@]}"; do
-        # Calcolo dei parametri scalati
+        # Compute current parameters based on scaling factor T
         CURR_NR=$((BASE_NR * T))
         CURR_NS=$((BASE_NS * T))
         CURR_MAX_KEY=$((BASE_MAX_KEY * T))
@@ -68,12 +68,12 @@ for dataset_name in "uniform" "skewed"; do
 
         echo -ne "${YELLOW}>> T=$T (N=$CURR_NR, P=$CURR_P, K=$CURR_MAX_KEY)... ${NC}"
         
-        # Esecuzione
+        # Execute the test and capture the output
         RUN_OUTPUT=$(srun -w "$NODE" --exclusive $EXEC \
             -nr $CURR_NR -ns $CURR_NS -seed $SEED -max-key $CURR_MAX_KEY -p $CURR_P -sched $SCHED -chunk $BEST_CHUNK -t $T \
             $dataset_params)
 
-        # Estrazione dati
+        # Extract relevant sections and metrics
         PART_R=$(echo "$RUN_OUTPUT" | sed -n '/PARTITION R/,/PARTITION S/p')
         PART_S=$(echo "$RUN_OUTPUT" | sed -n '/PARTITION S/,/JOIN PHASE/p')
         JOIN_P=$(echo "$RUN_OUTPUT" | sed -n '/JOIN PHASE/,/GLOBAL/p')
@@ -88,7 +88,7 @@ for dataset_name in "uniform" "skewed"; do
         RES_LOOP=$(extract_pair "$JOIN_P" "join_loop")
         RES_TOTAL=$(extract_pair "$GLOBAL_P" "TOTAL")
 
-        # Scrittura CSV (includiamo N, P e K per tracciabilità nel CSV)
+        # Append results to the appropriate CSV file
         echo "$T,$CURR_NR,$CURR_P,$CURR_MAX_KEY,$RES_HIST_R,$RES_SCAT_R,$RES_HIST_S,$RES_SCAT_S,$RES_BUILD,$RES_PROBE,$RES_LOOP,$RES_TOTAL" >> "$CURRENT_CSV"
         
         echo -e "${GREEN}OK!${NC}"

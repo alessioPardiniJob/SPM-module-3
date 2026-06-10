@@ -6,10 +6,10 @@
 NR=20000000
 NS=20000000
 SEED=42
-MAX_KEY=10000000 # Updated to 10 million
+MAX_KEY=10000000 
 P=256
 NODE="node07"
-THREADS=32 # Fixed thread count for parallel versions
+THREADS=32
 
 # Executables
 EXEC_SEQ="./bin/hashjoin_seq"

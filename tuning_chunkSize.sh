@@ -39,7 +39,7 @@ echo -e "${BLUE}================================================================
 echo -e "Fixed: NR=$NR, NS=$NS, P=$P, SEED=$SEED, MAX_KEY=$MAX_KEY\n"
 
 # ==============================================================================
-# Funzione: estrae i dati del log dato un tag (focalizzato sulla join)
+# Function: extract join_loop summary from log given a tag
 # ==============================================================================
 print_join_summary() {
     local tag="$1"
@@ -53,7 +53,7 @@ print_join_summary() {
 }
 
 # ==============================================================================
-# Funzione: esegue un singolo run e lo logga
+# Function: execute a single test run and log it
 # Args: dataset_name  dataset_params  chunk_size
 # ==============================================================================
 run_test() {
@@ -66,7 +66,7 @@ run_test() {
     echo -e "${YELLOW}>> [$dataset_name] chunk-size=$chunk_size${NC}"
     echo "=== RUN: $tag ===" >> "$LOG_FILE"
 
-    # Esecuzione srun con i parametri corretti per il task-level
+    # Execute the test with srun and log the output
     srun -w "$NODE" --exclusive --time=00:02:00 $EXEC \
         -nr $NR -ns $NS -seed $SEED -max-key $MAX_KEY -p $P \
         $dataset_params \
@@ -89,14 +89,14 @@ for dataset_name in "uniform" "skewed"; do
     echo -e "${CYAN}  DATASET: ${dataset_name^^}${NC}"
     echo -e "${CYAN}================================================================${NC}"
 
-    # Iterazione sui vari chunk sizes
+    # Iterate over the defined chunk sizes
     for chunk_size in "${CHUNK_SIZES[@]}"; do
         run_test "$dataset_name" "$dataset_params" "$chunk_size"
     done
 done
 
 # ==============================================================================
-# Riepilogo finale — join_loop median per ogni combinazione
+# Final summary of results
 # ==============================================================================
 echo -e "\n${BLUE}================================================================${NC}"
 echo -e "${BLUE}   RIEPILOGO FINALE — join_loop median (ms)${NC}"
