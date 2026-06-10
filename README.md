@@ -2,7 +2,7 @@
 
 ## Introduction
 This module evaluates the performance of a partitioned hash join implementation by comparing sequential execution with C++ threading and OpenMP-based parallel strategies (loop-level and task-level). The objective is to analyze scalability and robustness under uniform and skewed workloads
----
+
 
 ## Repository Structure
 ```text
@@ -44,7 +44,8 @@ This module evaluates the performance of a partitioned hash join implementation 
 │   ├── threadPool.hpp
 │   └── utils.hpp
 ├── weak_scalabilityLoopLevel.sh
-└── weak_scalabilityTaskLevel.sh
+├── weak_scalabilityTaskLevel.sh  
+└── bench_compare_all.sh
 ```
 # EXPERIMENT 0 — Skewness Analysis
 This initial experiment is intended to empirically verify that the data generation process is functioning correctly.
